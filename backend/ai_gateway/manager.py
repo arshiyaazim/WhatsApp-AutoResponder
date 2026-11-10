@@ -32,8 +32,9 @@ class GatewayManager:
     def __init__(self, database_path: str | None = None) -> None:
         self.secrets = SecretManager()
         self.store = GatewayStore(self.secrets, database_path)
-        providers = default_provider_configs() + custom_provider_defaults()
-        orders = default_fallback_orders()
+        custom_providers = custom_provider_defaults()
+        providers = default_provider_configs() + custom_providers
+        orders = default_fallback_orders([provider.provider_id for provider in custom_providers])
         for task in TASKS:
             orders.setdefault(task, [])
         self.store.initialize(providers, orders)

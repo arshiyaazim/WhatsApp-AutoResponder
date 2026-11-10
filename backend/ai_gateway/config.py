@@ -53,8 +53,8 @@ def default_provider_configs() -> list[ProviderConfig]:
     ]
 
 
-def default_fallback_orders() -> dict[str, list[str]]:
-    default = ["gemini-primary", "openai-secondary", "anthropic-third"]
+def default_fallback_orders(custom_provider_ids: list[str] | None = None) -> dict[str, list[str]]:
+    default = ["gemini-primary", "openai-secondary", "anthropic-third"] + list(custom_provider_ids or [])
     configured = _json_env("AI_FALLBACK_ORDER_JSON")
     if configured is not None:
         if not isinstance(configured, dict):
@@ -66,7 +66,6 @@ def default_fallback_orders() -> dict[str, list[str]]:
                 raise RuntimeError("AI_FALLBACK_ORDER_JSON has an invalid task or provider list")
             defaults[task] = order
         return defaults
-    default = ["gemini-primary", "openai-secondary", "anthropic-third"]
     return {
         "text_generation": default + ["local-tfidf"],
         "image_extraction": default.copy(),

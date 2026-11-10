@@ -15,7 +15,7 @@ from cryptography.fernet import Fernet
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ai_gateway.security.rate_limiter import RateLimiter, RateLimitUnavailable
-from ai_gateway.config import env_credentials
+from ai_gateway.config import default_fallback_orders, env_credentials
 from ai_gateway.monitoring.usage_tracker import UsageTracker
 from ai_gateway.types import ProviderResult
 from ai_gateway.security.access_control import verify_bearer_token
@@ -34,6 +34,14 @@ class ReleaseControlTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_custom_compatible_providers_follow_standard_provider_priority(self):
+        with patch.dict(os.environ, {"AI_FALLBACK_ORDER_JSON": ""}):
+            orders = default_fallback_orders(["compatible-one", "compatible-two"])
+        expected = ["gemini-primary", "openai-secondary", "anthropic-third", "compatible-one", "compatible-two"]
+        self.assertEqual(orders["text_generation"], expected + ["local-tfidf"])
+        self.assertEqual(orders["image_extraction"], expected)
+        self.assertEqual(orders["image_understanding"], expected)
 
     def test_invalid_or_non_finite_price_rates_remain_unknown(self):
         with patch.dict(os.environ, {"AI_MODEL_PRICING_JSON": json.dumps({
