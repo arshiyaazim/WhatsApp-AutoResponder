@@ -44,7 +44,8 @@ object SettingsStore {
                     KnowledgeEntry(it.optString("question"), it.optString("answer"), it.optString("keywords"))
                 }
             }.filter { it.question.isNotBlank() && it.answer.isNotBlank() }
-            AppSettings(
+            val tokenEncrypted = root.optBoolean("aiBackendTokenEncrypted", false)
+            val loaded = AppSettings(
                 autoReplyEnabled = root.optBoolean("autoReplyEnabled", false),
                 selectedPackages = packages,
                 allowlistOnly = root.optBoolean("allowlistOnly", false),
@@ -52,10 +53,25 @@ object SettingsStore {
                 knowledge = entries,
                 generativeAiEnabled = root.optBoolean("generativeAiEnabled", false),
                 aiBackendUrl = root.optString("aiBackendUrl", ""),
-                aiBackendToken = root.optString("aiBackendToken", ""),
+                aiBackendToken = if (tokenEncrypted) {
+                    BackendTokenCipher.decrypt(root.optString("aiBackendToken", ""))
+                } else {
+                    root.optString("aiBackendToken", "")
+                },
                 callAutomationEnabled = root.optBoolean("callAutomationEnabled", false),
                 callAction = root.optString("callAction", "observe")
             )
+            if (!tokenEncrypted && loaded.aiBackendToken.isNotEmpty()) {
+                try {
+                    save(context, loaded)
+                } catch (_: Exception) {
+                    // Never keep using a legacy plaintext token if device encryption is unavailable.
+                    val withoutToken = loaded.copy(aiBackendToken = "")
+                    save(context, withoutToken)
+                    return withoutToken
+                }
+            }
+            loaded
         } catch (_: Exception) {
             AppSettings()
         }
@@ -76,7 +92,8 @@ object SettingsStore {
             })
             .put("generativeAiEnabled", settings.generativeAiEnabled)
             .put("aiBackendUrl", settings.aiBackendUrl)
-            .put("aiBackendToken", settings.aiBackendToken)
+            .put("aiBackendToken", BackendTokenCipher.encrypt(settings.aiBackendToken))
+            .put("aiBackendTokenEncrypted", true)
             .put("callAutomationEnabled", settings.callAutomationEnabled)
             .put("callAction", settings.callAction)
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, root.toString()).apply()

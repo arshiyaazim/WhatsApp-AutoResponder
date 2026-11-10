@@ -1,6 +1,6 @@
 services:
   ai-gateway:
-    image: whatsapp-ai-gateway:${AI_GATEWAY_IMAGE_TAG:-local}
+    image: whatsapp-ai-gateway:${AI_GATEWAY_IMAGE_TAG:?Set an immutable release tag in the root .env}
     build:
       context: ./backend
     environment:
@@ -17,8 +17,14 @@ services:
       ANTHROPIC_API_KEYS_JSON_FILE: /run/secrets/anthropic_api_keys
       CUSTOM_OPENAI_API_KEYS_JSON_FILE: /run/secrets/custom_openai_api_keys
     env_file:
-      - ./backend/.env
+      - ./.env
     restart: unless-stopped
+    mem_limit: ${AI_GATEWAY_MEMORY_LIMIT:-768m}
+    cpus: ${AI_GATEWAY_CPU_LIMIT:-1.0}
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       rate-limit:
         condition: service_healthy
@@ -53,9 +59,15 @@ services:
       start_period: 15s
 
   rate-limit:
-    image: redis:7-alpine
+    image: redis:7.4.12-alpine3.22
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--save", "60", "1", "--maxmemory", "64mb", "--maxmemory-policy", "noeviction"]
     restart: unless-stopped
+    mem_limit: ${RATE_LIMIT_MEMORY_LIMIT:-128m}
+    cpus: ${RATE_LIMIT_CPU_LIMIT:-0.5}
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "2"
     volumes:
       - rate-limit-data:/data
     networks:
