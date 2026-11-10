@@ -125,6 +125,15 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(result.fallback_count, 1)
         self.assertEqual([call[0] for call in self.calls], ["gemini", "openai"])
 
+    def test_falls_back_from_openai_to_anthropic(self):
+        self.order(text=["openai-secondary", "anthropic-third"])
+        self.add_key("openai-secondary", "openai-error", index=0)
+        self.add_key("anthropic-third", "anthropic-ok", index=1)
+        self.behavior["openai-error"] = ProviderError("temporary_service", "unavailable", 503, retryable=True)
+        result = self.manager.generate_text("hello", [{"question": "hello", "answer": "Hi"}], [])
+        self.assertEqual(result.provider_id, "anthropic-third")
+        self.assertEqual([call[0] for call in self.calls], ["openai", "anthropic"])
+
     def test_rate_limited_key_rotates_to_another_key(self):
         self.order()
         key1 = self.add_key("gemini-primary", "rate-key", "project-a", 0)
@@ -215,6 +224,32 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(GatewayUnavailable):
             self.manager.generate_text("hello", [{"question": "hello", "answer": "Hi!"}], [])
         self.assertEqual(self.calls, [("gemini", "text_generation", "first-failing-key")])
+
+    def test_uncertain_provider_failure_retains_reserved_spend(self):
+        self.manager.store.update_settings({"max_daily_spend_usd": 1.0, "max_request_spend_usd": 0.5,
+                                            "max_requests_per_day": 100})
+        self.order()
+        self.add_key("gemini-primary", "uncertain-key", "project-a")
+        self.behavior["uncertain-key"] = ProviderError("temporary_service", "timeout", 503, retryable=True)
+        self.manager.store.set_fallback_order({"text_generation": ["gemini-primary"]})
+        with self.assertRaises(GatewayUnavailable):
+            self.manager.generate_text("hello", [], [])
+        usage = self.manager.store.daily_usage()
+        self.assertEqual(usage["estimated_spend_usd"], 0.5)
+        self.assertTrue(usage["spend_estimate_includes_active_or_uncertain_reservations"])
+
+    def test_successful_provider_with_usage_persistence_failure_keeps_reservation_uncertain(self):
+        self.manager.store.update_settings({"max_daily_spend_usd": 1.0, "max_request_spend_usd": 0.5,
+                                            "max_requests_per_day": 100})
+        self.order(text=["gemini-primary"])
+        self.add_key("gemini-primary", "success-then-db-error", "project-a")
+        with patch.object(self.manager.store, "record_usage", side_effect=OSError("database unavailable")):
+            with self.assertRaises(OSError):
+                self.manager.generate_text("hello", [], [])
+        with self.manager.store._db() as db:
+            row = db.execute("SELECT state FROM budget_reservations ORDER BY created_at DESC LIMIT 1").fetchone()
+        self.assertEqual(row["state"], "uncertain")
+        self.assertEqual(self.manager.store.daily_usage()["estimated_spend_usd"], 0.5)
 
     def test_request_usage_does_not_store_prompt_text(self):
         self.order()

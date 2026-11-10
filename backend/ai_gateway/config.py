@@ -6,6 +6,7 @@ import os
 import re
 from typing import Any
 
+from .security.env import secret_value
 from .types import KeyCredential, ProviderConfig
 
 PROVIDER_TYPES = {"gemini", "openai", "anthropic", "custom_openai"}
@@ -13,7 +14,7 @@ TASKS = ("text_generation", "image_extraction", "image_understanding")
 
 
 def _json_env(name: str) -> Any:
-    raw = os.getenv(name, "").strip()
+    raw = secret_value(name)
     if not raw:
         return None
     try:
@@ -84,8 +85,9 @@ def env_credentials(provider_id: str, provider_type: str) -> list[KeyCredential]
     raw_entries = _json_env(list_name) or []
     if not isinstance(raw_entries, list):
         raise RuntimeError(f"{list_name} must be a JSON array")
-    if not raw_entries and os.getenv(legacy_name, "").strip():
-        legacy = {"key": os.environ[legacy_name]}
+    legacy_secret = secret_value(legacy_name)
+    if not raw_entries and legacy_secret:
+        legacy = {"key": legacy_secret}
         if provider_type == "gemini":
             legacy["project_id"] = os.getenv("GEMINI_PROJECT_ID", "")
         raw_entries = [legacy]

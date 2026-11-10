@@ -16,6 +16,49 @@ from ai_gateway.tasks.prompts import OCR_INSTRUCTIONS
 class AdapterRequestTests(unittest.TestCase):
     IMAGE = b"approved-image-bytes"
 
+    def test_gemini_text_generation_uses_configured_model_and_grounding_instructions(self):
+        response = SimpleNamespace(text="দোকান সকাল ৯টায় খোলে", usage_metadata=SimpleNamespace(prompt_token_count=12, candidates_token_count=7))
+        with patch("ai_gateway.providers.gemini.genai.Client") as client_factory:
+            client_factory.return_value.models.generate_content.return_value = response
+            result = GeminiAdapter().generate_text(api_key="test-key", model="gemini-stage",
+                instructions="grounded instructions", prompt="bilingual prompt")
+        client_options = client_factory.call_args.kwargs["http_options"]
+        self.assertEqual(client_options.timeout, 30_000)
+        self.assertEqual(client_options.retry_options.attempts, 1)
+        kwargs = client_factory.return_value.models.generate_content.call_args.kwargs
+        self.assertEqual(kwargs["model"], "gemini-stage")
+        self.assertEqual(kwargs["contents"], "bilingual prompt")
+        self.assertEqual(kwargs["config"].system_instruction, "grounded instructions")
+        self.assertEqual(result.text, "দোকান সকাল ৯টায় খোলে")
+        self.assertEqual((result.input_tokens, result.output_tokens), (12, 7))
+
+    def test_openai_text_generation_uses_responses_endpoint_and_output_bound(self):
+        response = SimpleNamespace(output_text="grounded answer", usage=SimpleNamespace(input_tokens=9, output_tokens=4))
+        with patch("ai_gateway.providers.openai.OpenAI") as client_factory:
+            client_factory.return_value.responses.create.return_value = response
+            result = OpenAIAdapter().generate_text(api_key="test-key", model="gpt-stage",
+                instructions="safe system", prompt="question")
+        kwargs = client_factory.return_value.responses.create.call_args.kwargs
+        self.assertEqual(kwargs["model"], "gpt-stage")
+        self.assertEqual(kwargs["instructions"], "safe system")
+        self.assertEqual(kwargs["input"], "question")
+        self.assertLessEqual(kwargs["max_output_tokens"], 500)
+        self.assertEqual(result.text, "grounded answer")
+
+    def test_anthropic_text_generation_uses_messages_endpoint_and_output_bound(self):
+        response = SimpleNamespace(content=[SimpleNamespace(type="text", text="fallback answer")],
+                                   usage=SimpleNamespace(input_tokens=9, output_tokens=4))
+        with patch("ai_gateway.providers.anthropic.Anthropic") as client_factory:
+            client_factory.return_value.messages.create.return_value = response
+            result = AnthropicAdapter().generate_text(api_key="test-key", model="claude-stage",
+                instructions="safe system", prompt="question")
+        kwargs = client_factory.return_value.messages.create.call_args.kwargs
+        self.assertEqual(kwargs["model"], "claude-stage")
+        self.assertEqual(kwargs["system"], "safe system")
+        self.assertEqual(kwargs["messages"][0]["content"], "question")
+        self.assertLessEqual(kwargs["max_tokens"], 500)
+        self.assertEqual(result.text, "fallback answer")
+
     def test_gemini_ocr_uses_bilingual_json_prompt_and_typed_image_part(self):
         response = SimpleNamespace(text='{"extracted_text":"শুভ সকাল\\nGood morning","language":"Bengali and English","extraction_status":"complete","warnings":[]}', usage_metadata=None)
         with patch("ai_gateway.providers.gemini.genai.Client") as client_factory:

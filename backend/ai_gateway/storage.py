@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import stat
@@ -80,6 +81,12 @@ class GatewayStore:
                 );
                 CREATE INDEX IF NOT EXISTS usage_created_idx ON usage_events(created_at DESC);
                 CREATE INDEX IF NOT EXISTS usage_request_idx ON usage_events(request_id);
+                CREATE TABLE IF NOT EXISTS budget_reservations (
+                    request_id TEXT PRIMARY KEY, day_start REAL NOT NULL, reserved_spend_usd REAL NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL,
+                    settled_cost_usd REAL
+                );
+                CREATE INDEX IF NOT EXISTS budget_day_idx ON budget_reservations(day_start,state);
             """)
             now = time.time()
             for provider in providers:
@@ -94,6 +101,7 @@ class GatewayStore:
                 "max_requests_per_day": max(1, int(os.getenv("AI_MAX_REQUESTS_PER_DAY", "1000"))),
                 "max_requests_per_minute": max(1, int(os.getenv("REQUESTS_PER_MINUTE", "20"))),
                 "max_daily_spend_usd": os.getenv("AI_MAX_DAILY_SPEND_USD", ""),
+                "max_request_spend_usd": os.getenv("AI_MAX_REQUEST_SPEND_USD", ""),
             }
             for key, value in defaults.items():
                 db.execute("INSERT OR IGNORE INTO gateway_settings(key,value) VALUES(?,?)", (key, json.dumps(value)))
@@ -101,6 +109,23 @@ class GatewayStore:
             os.chmod(self.database_path, stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
             pass
+
+    def readiness_check(self) -> tuple[bool, str]:
+        """Check SQLite connectivity, required initialized tables, and database-page integrity."""
+        try:
+            with self._db() as db:
+                tables = {row[0] for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                required = {"providers", "api_keys", "gateway_settings", "usage_events", "budget_reservations"}
+                if not required.issubset(tables):
+                    return False, "database_schema_incomplete"
+                check = db.execute("PRAGMA quick_check(1)").fetchone()[0]
+                if check != "ok":
+                    return False, "database_integrity_check_failed"
+                db.execute("SELECT 1").fetchone()
+            return True, "ready"
+        except (sqlite3.Error, OSError):
+            return False, "database_unavailable"
 
     def providers(self) -> list[ProviderConfig]:
         with self._db() as db:
@@ -295,16 +320,160 @@ class GatewayStore:
         return {row["key"]: json.loads(row["value"]) for row in rows}
 
     def update_settings(self, values: dict[str, Any]) -> None:
-        with self._db() as db:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = {row["key"]: json.loads(row["value"]) for row in
+                       conn.execute("SELECT key,value FROM gateway_settings").fetchall()}
+            candidate = {**current, **values}
+            now = time.time()
+            day_start = self._utc_day_start(now)
+            request_count = conn.execute("""SELECT COUNT(*) FROM (
+                SELECT request_id FROM usage_events WHERE created_at>=?
+                UNION SELECT request_id FROM budget_reservations WHERE day_start=?
+            )""", (day_start, day_start)).fetchone()[0]
+            new_request_limit = int(candidate.get("max_requests_per_day", 1000))
+            if request_count > new_request_limit:
+                raise ValueError("Cannot lower the daily request limit below requests already used or reserved")
+            daily_budget = candidate.get("max_daily_spend_usd")
+            request_budget = candidate.get("max_request_spend_usd")
+            if daily_budget not in (None, ""):
+                daily_budget = float(daily_budget)
+                if not math.isfinite(daily_budget) or daily_budget < 0:
+                    raise ValueError("Daily spend limit must be a finite non-negative amount")
+            if request_budget not in (None, ""):
+                request_budget = float(request_budget)
+                if not math.isfinite(request_budget) or request_budget < 0:
+                    raise ValueError("Per-request spend reservation must be a finite non-negative amount")
+            if daily_budget not in (None, ""):
+                if request_budget not in (None, "") and request_budget > daily_budget:
+                    raise ValueError("Per-request reservation must not exceed the daily spend limit")
+                used = conn.execute("""SELECT COALESCE(SUM(estimated_cost_usd),0) FROM usage_events
+                    WHERE created_at>=? AND request_id NOT IN (
+                      SELECT request_id FROM budget_reservations WHERE day_start=? AND state IN ('reserved','uncertain'))
+                """, (day_start, day_start)).fetchone()[0]
+                reserved = conn.execute("""SELECT COALESCE(SUM(reserved_spend_usd),0) FROM budget_reservations
+                    WHERE day_start=? AND state IN ('reserved','uncertain')""", (day_start,)).fetchone()[0]
+                if float(used or 0) + float(reserved or 0) > daily_budget:
+                    raise ValueError("Cannot lower the daily spend limit below usage already charged or reserved")
             for key, value in values.items():
-                db.execute("INSERT INTO gateway_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                           (key, json.dumps(value)))
+                conn.execute("INSERT INTO gateway_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                             (key, json.dumps(value)))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _utc_day_start(now: float) -> float:
+        return now - (now % 86400)
+
+    def reserve_budget(self, request_id: str, *, now: float | None = None, lease_seconds: int = 900) -> tuple[bool, str | None]:
+        """Atomically reserve one logical request and its configured spend allowance across workers."""
+        now = time.time() if now is None else now
+        day_start = self._utc_day_start(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Expiry is conservative: an abandoned in-flight provider call may still have been billed.
+            conn.execute("UPDATE budget_reservations SET state='uncertain' WHERE state='reserved' AND expires_at<=?", (now,))
+            conn.execute("DELETE FROM budget_reservations WHERE day_start<?", (day_start - 90 * 86400,))
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT state FROM budget_reservations WHERE request_id=?", (request_id,)).fetchone()
+            if existing:
+                conn.commit()
+                return False, "duplicate_request_id"
+            settings = {row["key"]: json.loads(row["value"]) for row in
+                        conn.execute("SELECT key,value FROM gateway_settings").fetchall()}
+            max_requests = int(settings.get("max_requests_per_day", 1000))
+            request_count = conn.execute("""SELECT COUNT(*) FROM (
+                SELECT request_id FROM usage_events WHERE created_at>=?
+                UNION SELECT request_id FROM budget_reservations WHERE day_start=?
+            )""", (day_start, day_start)).fetchone()[0]
+            if request_count >= max_requests:
+                conn.rollback()
+                return False, "request_budget_exhausted"
+            budget = settings.get("max_daily_spend_usd")
+            reservation = 0.0
+            if budget not in (None, ""):
+                budget = float(budget)
+                if not math.isfinite(budget) or budget < 0:
+                    raise ValueError("Daily spend limit must be finite and non-negative")
+                if budget <= 0:
+                    conn.rollback()
+                    return False, "spending_budget_exhausted"
+                committed = conn.execute("""SELECT COALESCE(SUM(estimated_cost_usd),0) FROM usage_events
+                    WHERE created_at>=? AND request_id NOT IN (
+                      SELECT request_id FROM budget_reservations WHERE day_start=? AND state IN ('reserved','uncertain'))
+                """, (day_start, day_start)).fetchone()[0]
+                reserved = conn.execute("""SELECT COALESCE(SUM(reserved_spend_usd),0) FROM budget_reservations
+                    WHERE day_start=? AND state IN ('reserved','uncertain')""", (day_start,)).fetchone()[0]
+                remaining = budget - float(committed or 0) - float(reserved or 0)
+                if remaining <= 0:
+                    conn.rollback()
+                    return False, "spending_budget_exhausted"
+                configured_reservation = settings.get("max_request_spend_usd")
+                reservation = float(configured_reservation) if configured_reservation not in (None, "") else remaining
+                if not math.isfinite(reservation) or reservation < 0:
+                    raise ValueError("Per-request spend reservation must be finite and non-negative")
+                if reservation <= 0:
+                    conn.rollback()
+                    return False, "spending_reservation_misconfigured"
+                if reservation > remaining:
+                    conn.rollback()
+                    return False, "spending_budget_exhausted"
+            conn.execute("INSERT INTO budget_reservations(request_id,day_start,reserved_spend_usd,state,created_at,expires_at) VALUES(?,?,?,'reserved',?,?)",
+                         (request_id, day_start, reservation, now, now + max(30, lease_seconds)))
+            conn.commit()
+            return True, None
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def finish_budget(self, request_id: str, *, uncertain: bool = False) -> None:
+        """Settle once; uncertain calls keep their full reservation until the UTC day rolls over."""
+        with self._db() as db:
+            row = db.execute("SELECT state,reserved_spend_usd FROM budget_reservations WHERE request_id=?", (request_id,)).fetchone()
+            if not row or row["state"] not in {"reserved", "uncertain"}:
+                return
+            cost = db.execute("SELECT SUM(estimated_cost_usd) FROM usage_events WHERE request_id=?", (request_id,)).fetchone()[0]
+            known_cost = float(cost) if cost is not None else 0.0
+            if uncertain and row["state"] == "reserved":
+                db.execute("UPDATE budget_reservations SET state='uncertain' WHERE request_id=? AND state='reserved'", (request_id,))
+                row = {"state": "uncertain", "reserved_spend_usd": row["reserved_spend_usd"]}
+            if row["state"] == "uncertain":
+                # A known successful fallback may have a reported estimate above the held allowance.
+                db.execute("UPDATE budget_reservations SET reserved_spend_usd=MAX(reserved_spend_usd,?),settled_cost_usd=? WHERE request_id=? AND state='uncertain'",
+                           (known_cost, known_cost, request_id))
+                return
+            db.execute("UPDATE budget_reservations SET state='settled',settled_cost_usd=? WHERE request_id=? AND state='reserved'",
+                       (known_cost, request_id))
+
+    def mark_budget_uncertain(self, request_id: str) -> None:
+        with self._db() as db:
+            db.execute("UPDATE budget_reservations SET state='uncertain' WHERE request_id=? AND state='reserved'", (request_id,))
 
     def daily_usage(self) -> dict[str, Any]:
-        day_start = time.time() - (time.time() % 86400)
+        now = time.time()
+        day_start = self._utc_day_start(now)
         with self._db() as db:
-            row = db.execute("SELECT COUNT(*) requests, SUM(estimated_cost_usd) spend FROM usage_events WHERE created_at>=?", (day_start,)).fetchone()
-        return {"requests": int(row["requests"] or 0), "estimated_spend_usd": row["spend"]}
+            count = db.execute("""SELECT COUNT(*) FROM (
+                SELECT request_id FROM usage_events WHERE created_at>=?
+                UNION SELECT request_id FROM budget_reservations WHERE day_start=?
+            )""", (day_start, day_start)).fetchone()[0]
+            events_cost = db.execute("""SELECT COALESCE(SUM(estimated_cost_usd),0) FROM usage_events
+                WHERE created_at>=? AND request_id NOT IN (
+                  SELECT request_id FROM budget_reservations WHERE day_start=? AND state IN ('reserved','uncertain'))
+            """, (day_start, day_start)).fetchone()[0]
+            reserved = db.execute("""SELECT COALESCE(SUM(reserved_spend_usd),0) FROM budget_reservations
+                WHERE day_start=? AND state IN ('reserved','uncertain')""", (day_start,)).fetchone()[0]
+        return {"requests": int(count or 0), "estimated_spend_usd": float(events_cost or 0) + float(reserved or 0),
+                "spend_estimate_includes_active_or_uncertain_reservations": bool(reserved)}
 
     def error_summary(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._db() as db:

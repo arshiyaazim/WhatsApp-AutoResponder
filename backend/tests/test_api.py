@@ -1,8 +1,11 @@
 import asyncio
+import asyncio
 import os
 import pathlib
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from io import BytesIO
 from unittest.mock import patch
@@ -12,8 +15,10 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import Headers, UploadFile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+os.environ["RATE_LIMIT_BACKEND"] = "memory"  # Explicit single-process test backend.
 import app as gateway
 from ai_gateway.types import GatewayResult
+from ai_gateway.security.rate_limiter import RateLimitUnavailable
 
 
 class FakeImageManager:
@@ -47,7 +52,7 @@ class ApiTests(unittest.TestCase):
         })
         self.env.start()
         gateway.get_manager.cache_clear()
-        gateway._requests.clear()
+        gateway.rate_limiter._requests.clear()
         self.client = TestClient(gateway.app)
         self.headers = {"Authorization": "Bearer app-test-token"}
         self.admin_headers = {"Authorization": "Bearer admin-test-token"}
@@ -65,7 +70,27 @@ class ApiTests(unittest.TestCase):
     def test_health_is_public_and_does_not_expose_configuration(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"ok": True, "service": "ai-gateway"})
+        self.assertEqual(response.json(), {"ok": True, "service": "ai-gateway", "status": "live"})
+
+    def test_readiness_checks_initialized_database(self):
+        response = self.client.get("/health/ready")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ready")
+
+    def test_rate_limiter_backend_failure_fails_closed_for_app_and_admin(self):
+        original = gateway.rate_limiter
+        class Unavailable:
+            @staticmethod
+            def allow(_identity, _limit):
+                raise RateLimitUnavailable("redis unavailable")
+        gateway.rate_limiter = Unavailable()
+        try:
+            normal = self.client.post("/api/ai/generate", json=self.payload)
+            admin = self.client.get("/api/admin/providers")
+        finally:
+            gateway.rate_limiter = original
+        self.assertEqual(normal.status_code, 503)
+        self.assertEqual(admin.status_code, 503)
 
     def test_legacy_endpoint_requires_existing_app_token(self):
         response = self.client.post("/v1/reply", json=self.payload)
@@ -252,6 +277,67 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(data, image)
         self.assertEqual(mime, "image/png")
         self.assertTrue(temporary_file.closed)
+
+    def test_upload_timeout_releases_concurrency_slot_and_file_pipeline(self):
+        finished = threading.Event()
+        class SlowManager:
+            def process_image(self, *args, **kwargs):
+                time.sleep(0.1)
+                finished.set()
+                return FakeImageManager().process_image(*args, **kwargs)
+        original_slots = gateway._upload_slots._value
+        with patch.object(gateway, "get_manager", return_value=SlowManager()), \
+                patch.object(gateway, "UPLOAD_REQUEST_TIMEOUT_SECONDS", 0.01):
+            response = self.client.post("/api/ai/extract-image", headers=self.headers,
+                files={"file": ("chosen.png", b"\x89PNG\r\n\x1a\nbody", "image/png")})
+        self.assertEqual(response.status_code, 408)
+        self.assertTrue(finished.wait(1))
+        deadline = time.monotonic() + 1
+        released = gateway._image_processing_slots.acquire(blocking=False)
+        while not released and time.monotonic() < deadline:
+            time.sleep(0.005)
+            released = gateway._image_processing_slots.acquire(blocking=False)
+        self.assertTrue(released, "completed provider work did not release its processing permit")
+        gateway._image_processing_slots.release()
+        self.assertEqual(gateway._upload_slots._value, original_slots)
+
+    def test_cancelled_upload_keeps_provider_slot_until_worker_finishes(self):
+        started = threading.Event()
+        finish_worker = threading.Event()
+        finished = threading.Event()
+        class SlowManager:
+            def process_image(self, *args, **kwargs):
+                started.set()
+                finish_worker.wait(1)
+                finished.set()
+                return FakeImageManager().process_image(*args, **kwargs)
+
+        async def exercise_cancellation():
+            upload = UploadFile(filename="chosen.png", file=BytesIO(b"\x89PNG\r\n\x1a\nbody"),
+                                headers=Headers({"content-type": "image/png"}))
+            with patch.object(gateway, "get_manager", return_value=SlowManager()):
+                task = asyncio.create_task(gateway._image_request("image_extraction", upload, "", "", ""))
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                acquired = [gateway._image_processing_slots.acquire(blocking=False)
+                            for _ in range(gateway.MAX_CONCURRENT_UPLOADS)]
+                self.assertEqual(sum(acquired), gateway.MAX_CONCURRENT_UPLOADS - 1)
+                for permit in acquired:
+                    if permit:
+                        gateway._image_processing_slots.release()
+                finish_worker.set()
+                self.assertTrue(await asyncio.to_thread(finished.wait, 1))
+                deadline = time.monotonic() + 1
+                released = gateway._image_processing_slots.acquire(blocking=False)
+                while not released and time.monotonic() < deadline:
+                    await asyncio.sleep(0.005)
+                    released = gateway._image_processing_slots.acquire(blocking=False)
+                self.assertTrue(released)
+                gateway._image_processing_slots.release()
+
+        asyncio.run(exercise_cancellation())
 
     def test_provider_admin_can_toggle_key_without_revealing_secret(self):
         manager = gateway.get_manager()
