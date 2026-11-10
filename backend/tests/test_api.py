@@ -1,16 +1,18 @@
+import asyncio
 import os
 import pathlib
 import sys
 import tempfile
 import unittest
+from io import BytesIO
 from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
+from starlette.datastructures import Headers, UploadFile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import app as gateway
-from ai_gateway.manager import GatewayManager
 from ai_gateway.types import GatewayResult
 
 
@@ -78,6 +80,15 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["reply"], "বাংলায় উত্তর")
         self.assertEqual(response.json()["provider_used"], "gemini-primary")
 
+    def test_legacy_no_reply_sentinel_preserves_silence_contract(self):
+        manager = gateway.get_manager()
+        result = GatewayResult("  [NO_REPLY]\n", "gemini-primary", "gemini-text", "req-silent", 0)
+        with patch.object(manager, "generate_text", return_value=result):
+            response = self.client.post("/v1/reply", json=self.payload, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["reply"], "")
+        self.assertEqual(response.json()["text"], "")
+
     def test_public_provider_catalog_contains_no_secret(self):
         response = self.client.get("/api/ai/providers", headers=self.headers)
         self.assertEqual(response.status_code, 200)
@@ -89,6 +100,12 @@ class ApiTests(unittest.TestCase):
     def test_admin_endpoints_require_separate_token(self):
         response = self.client.get("/api/admin/providers", headers=self.headers)
         self.assertEqual(response.status_code, 401)
+
+    def test_equal_app_and_admin_tokens_fail_closed(self):
+        with patch.dict(os.environ, {"APP_ACCESS_TOKEN": "same-token", "ADMIN_ACCESS_TOKEN": "same-token"}):
+            response = self.client.get("/api/admin/providers", headers={"Authorization": "Bearer same-token"})
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("same-token", response.text)
 
     def test_admin_key_is_encrypted_and_never_returned(self):
         provider = {
@@ -109,6 +126,19 @@ class ApiTests(unittest.TestCase):
         db_path = os.environ["AI_GATEWAY_DATABASE_PATH"]
         with open(db_path, "rb") as database:
             self.assertNotIn(api_key.encode(), database.read())
+
+    def test_gemini_project_ids_are_normalized_for_shared_quota(self):
+        first = self.client.post("/api/admin/providers/gemini-primary/keys",
+                                 json={"api_key": "project-key-first-123", "project_id": " shared-project "},
+                                 headers=self.admin_headers)
+        second = self.client.post("/api/admin/providers/gemini-primary/keys",
+                                  json={"api_key": "project-key-second-456", "project_id": "shared-project"},
+                                  headers=self.admin_headers)
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(first.json()["project_id"], "shared-project")
+        keys = gateway.get_manager().store.database_credentials("gemini-primary")
+        self.assertEqual({key.project_id for key in keys}, {"shared-project"})
 
     def test_validation_errors_do_not_echo_submitted_api_key(self):
         provider = {
@@ -139,6 +169,17 @@ class ApiTests(unittest.TestCase):
         response = self.client.post("/api/ai/extract-image",
                                     files={"file": ("user-image.png", image, "image/png")})
         self.assertEqual(response.status_code, 401)
+
+    def test_unauthenticated_streamed_image_body_is_rejected_before_reading(self):
+        consumed = []
+        def chunks():
+            consumed.append(True)
+            yield b"untrusted upload payload"
+        response = self.client.post("/api/ai/extract-image", headers={
+            "Content-Type": "multipart/form-data; boundary=unused"
+        }, content=chunks())
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(consumed, [])
 
     def test_image_understanding_accepts_only_explicit_multipart_fields(self):
         fake = FakeImageManager()
@@ -173,6 +214,24 @@ class ApiTests(unittest.TestCase):
         self.assertIsNone(data["confidence_or_uncertainty"]["confidence"])
         self.assertEqual(fake.seen[2], image)
 
+    def test_streamed_request_body_limit_applies_without_content_length(self):
+        boundary = "chunked-test-boundary"
+        def chunks():
+            separator = bytes((13, 10))
+            yield (b"--" + boundary.encode() + separator +
+                   b'Content-Disposition: form-data; name="file"; filename="large.png"' + separator +
+                   b"Content-Type: image/png" + separator + separator)
+            block = b"x" * 65536
+            sent = 0
+            while sent <= gateway.MAX_BODY_BYTES:
+                yield block
+                sent += len(block)
+            yield separator + b"--" + boundary.encode() + b"--" + separator
+        response = self.client.post("/api/ai/extract-image", headers={
+            **self.headers, "Content-Type": f"multipart/form-data; boundary={boundary}"
+        }, content=chunks())
+        self.assertEqual(response.status_code, 413)
+
     def test_image_endpoint_enforces_size_limit(self):
         old_limit = gateway.MAX_IMAGE_BYTES
         gateway.MAX_IMAGE_BYTES = 16
@@ -183,6 +242,16 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 413)
         finally:
             gateway.MAX_IMAGE_BYTES = old_limit
+
+    def test_uploaded_file_handle_is_closed_after_read(self):
+        image = b"\x89PNG\r\n\x1a\n" + b"test-image"
+        temporary_file = BytesIO(image)
+        upload = UploadFile(file=temporary_file, filename="chosen.png",
+                            headers=Headers({"content-type": "image/png"}))
+        data, mime = asyncio.run(gateway._read_upload(upload))
+        self.assertEqual(data, image)
+        self.assertEqual(mime, "image/png")
+        self.assertTrue(temporary_file.closed)
 
     def test_provider_admin_can_toggle_key_without_revealing_secret(self):
         manager = gateway.get_manager()

@@ -32,6 +32,12 @@ class ProviderErrorAndOcrTests(unittest.TestCase):
         error = ProviderAdapter.normalize_error(FakeProviderException(429, "rate limit", {"Retry-After": "37"}))
         self.assertEqual(error.retry_after_seconds, 37.0)
 
+    def test_retry_after_is_clamped_and_non_finite_values_are_ignored(self):
+        huge = ProviderAdapter.normalize_error(FakeProviderException(429, "rate limit", {"Retry-After": "1e100"}))
+        self.assertEqual(huge.retry_after_seconds, 3600.0)
+        not_a_number = ProviderAdapter.normalize_error(FakeProviderException(429, "rate limit", {"Retry-After": "NaN"}))
+        self.assertIsNone(not_a_number.retry_after_seconds)
+
     def test_ocr_json_is_normalized_without_fabricated_confidence(self):
         result = normalize_ocr_result('{"extracted_text":"লাইন ১\\n[unclear]","language":"Bengali","extraction_status":"partial","warnings":["blur"]}')
         self.assertEqual(result["extracted_text"], "লাইন ১\n[unclear]")
