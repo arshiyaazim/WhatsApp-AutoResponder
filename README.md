@@ -1,52 +1,83 @@
-# WhatsApp Auto Responder — Android companion + AI gateway prototype
+# WhatsApp Auto Responder — Android companion + multi-provider AI Gateway
 
-Android companion app-টি notification থেকে message পড়ে, বাছাই করা knowledge base ও ঐচ্ছিক Generative AI backend দিয়ে reply তৈরি করার চেষ্টা করে। এটি পরীক্ষামূলক; production-ready বা WhatsApp-এর official integration নয়।
+Android companion prototype that reads supported WhatsApp/WhatsApp Business notifications, applies sender rules and local knowledge, and may use an optional secure backend to draft a reply. It is not an official WhatsApp integration and is not production-certified.
 
-## ফিচার
+## Features and boundaries
 
-- WhatsApp (`com.whatsapp`) ও WhatsApp Business (`com.whatsapp.w4b`) app package নির্বাচন, master auto-reply switch এবং sender Allow/Deny rule CRUD ও Allowlist mode।
-- UI-তে knowledge entry add/edit/delete এবং JSON import। নমুনা: `knowledge_base.example.json`।
-- **Local mode:** internet/API ছাড়াই local TF-IDF শব্দ-মিল; মিল না পেলে reply নয়।
-- **Generative AI mode:** Android app HTTPS-এ নিজের backend-এ request পাঠায়। Backend OpenAI Responses API-তে message, সাম্প্রতিক conversation এবং knowledge base পাঠিয়ে উত্তর তৈরি করে। Model-এর কাছে অপ্রাসঙ্গিক/অপর্যাপ্ত knowledge হলে `[NO_REPLY]` ফেরত দিতে বলা হয়। ৩০টি বা কম knowledge entry হলে সবগুলো context হিসেবে যায়; ৩০টির বেশি হলে app স্থানীয় lexical matcher দিয়ে সেরা ৩০টি বেছে নেয়।
-- WhatsApp notification-এ inline reply action পাওয়া গেলেই উত্তর পাঠানোর চেষ্টা হয়। Android Notification Access ব্যবহারকারীকে নিজে অনুমতি দিতে হবে।
+- Select WhatsApp (`com.whatsapp`) and/or WhatsApp Business (`com.whatsapp.w4b`), set a master auto-reply switch, and manage sender Allow/Deny rules and Allowlist mode.
+- Local TF-IDF knowledge matching works without network access; when there is no sufficiently relevant entry, it does not reply.
+- Optional backend AI uses the provider-independent gateway. Default task order is Gemini → OpenAI → Anthropic; order is configurable per task, with local TF-IDF only as the final text fallback. Provider adapters expose task capabilities, so images are not sent to text-only providers. OpenAI Responses is supported, alongside Anthropic and custom OpenAI-compatible chat-completions endpoints.
+- Multiple keys per provider are supported. Gemini keys require project IDs; quota exhaustion applies to the whole project, not each individual key. Key rotation, health/cooldown state, bounded failover, normalized errors, usage metadata and optional estimated-cost limits are supported.
+- The app preserves the `/v1/reply` endpoint and `APP_ACCESS_TOKEN` bearer contract. WhatsApp sending still only uses the existing notification inline-reply action; AI cannot independently send a WhatsApp message.
+- A separate manual image/PDF picker offers OCR and image understanding. Only the file explicitly selected by the user is sent over HTTPS. Notification media is not automatically accessed. Uploads are size/type/signature checked, handled in memory, and not intentionally persisted by the gateway.
+- Per-contact local conversation context is limited to recent turns; sender identity is not sent to the gateway. Messages, history, image text and knowledge entries are treated as untrusted data, not instructions. Empty/unsupported knowledge does not authorize the model to invent facts.
+- The prototype does not support WhatsApp call automation, or separate identification of multiple accounts inside one WhatsApp package.
 
-## Generative AI backend চালানো
+## Secure backend setup
 
-OpenAI API key **কখনো Android app বা Git-এ রাখবেন না**. Backend-এ OpenAI key server environment secret হিসেবে থাকে; Android-এ আলাদা backend access token বসে। ChatGPT Plus সাবস্ক্রিপশন API usage-এর খরচ অন্তর্ভুক্ত করে না—API billing আলাদা।
+Provider secrets belong only on the backend. Never put a provider API key in the Android app, APK, repository, or chat. The Android app stores only its backend URL and `APP_ACCESS_TOKEN`; production apps should replace shared-token authentication with per-device/user credentials and add operational controls appropriate for public use.
 
-1. Python 3.12 ও Docker ব্যবহার করুন। `backend/.env.example` কপি করে `backend/.env` বানান এবং server-এ secret হিসেবে সেট করুন:
-   - `OPENAI_API_KEY` — OpenAI API key
-   - `OPENAI_MODEL` — ডিফল্ট `gpt-4.1-mini`
-   - `APP_ACCESS_TOKEN` — শক্তিশালী random token (উদাহরণ: `openssl rand -hex 32`)
-   - ঐচ্ছিক `REQUESTS_PER_MINUTE` — IP-প্রতি rate limit, ডিফল্ট ২০
-2. Project root থেকে চালান:
+1. Copy `backend/.env.example` to `backend/.env` on the backend host; keep that file private and out of source control. Set distinct random values for `APP_ACCESS_TOKEN` and `ADMIN_ACCESS_TOKEN`. Generate the optional Fernet key for administrator-added keys with:
 
    ```bash
-   docker build -t wa-auto-responder-ai ./backend
-   docker run --rm --env-file backend/.env -p 8000:8000 wa-auto-responder-ai
+   python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
    ```
 
-3. Android app-এ **Generative AI** চালু করে backend-এর **HTTPS root URL** (যেমন `https://your-host.example`) ও একই `APP_ACCESS_TOKEN` লিখে **AI সেটিংস সংরক্ষণ** করুন। Public deployment-এ TLS/HTTPS বাধ্যতামূলক; Android client HTTP গ্রহণ করে না। `/health` endpoint দিয়ে backend health পরীক্ষা করা যায়।
-4. OpenAI usage, rate limits ও hosting bill পর্যবেক্ষণ করুন। Test-এর জন্য প্রথমে অল্প কয়েকটি knowledge entry ও নিজের chat ব্যবহার করুন।
+   Set `PROVIDER_ENCRYPTION_KEY` before adding database-managed provider keys. Back it up securely: losing it makes encrypted keys unreadable. Environment-managed keys can instead be supplied as server environment variables or JSON arrays, for example `GEMINI_API_KEYS_JSON='[{"key":"...","project_id":"my-google-project"}]'` and `OPENAI_API_KEYS_JSON='[{"key":"..."}]'`. Never commit real values. Gemini keys belonging to the same project share quota.
 
-Local mode ব্যবহার করতে Generative AI switch বন্ধ রাখুন। AI mode-এ backend unavailable, token ভুল বা knowledge খালি থাকলে local fallback হবে না—অ্যাপ নীরব থাকবে।
+2. Configure model IDs via `GEMINI_*_MODEL`, `OPENAI_*_MODEL`, and `ANTHROPIC_*_MODEL`. Default provider order is Gemini, OpenAI, Anthropic (plus local TF-IDF for text). Optional `AI_FALLBACK_ORDER_JSON` can set task orders at startup; administrators can also configure task order via the protected API. `AI_AUTOMATIC_FAILOVER=false` disables automatic provider/key failover.
 
-## Android app তৈরি ও সেটআপ
+3. Start with Docker Compose from the repository root:
 
-1. Android Studio, JDK 17, Android SDK 35, Gradle 8.9 (AGP 8.7.3) ব্যবহার করুন। এই checkout-এ Gradle wrapper নেই; local Gradle দিয়ে project sync/build করুন, অথবা `gradle wrapper --gradle-version 8.9` project root-এ চালিয়ে wrapper তৈরি করে Android Studio-তে project খুলুন, Gradle sync করুন, তারপর `app` configuration চালান।
-2. ফোনে অ্যাপ install করে **নোটিফিকেশন অ্যাক্সেস সেট করুন** চাপুন এবং Android Settings-এ Notification Access অনুমোদন করুন।
-3. কোন WhatsApp app থেকে কাজ করবে বাছুন; sender Allow/Deny rules ও knowledge base সেট করুন। অটো-রিপ্লে শুরুতে বন্ধ থাকে।
-4. Generative AI ব্যবহার করলে backend URL/token save করুন; তারপর AI switch ও master auto-reply switch চালু করুন। প্রথমে পরীক্ষামূলক chat-এ পরীক্ষা করুন।
+   ```bash
+   cp backend/.env.example backend/.env
+   # Edit backend/.env with private values and provider keys
+   docker compose -f compose.yaml config
+   docker compose -f compose.yaml up -d --build
+   docker compose -f compose.yaml logs -f ai-gateway
+   ```
 
-## ডেটা, privacy ও নিরাপত্তা
+   Compose binds the container to `127.0.0.1:8000`, stores SQLite state in a named volume, runs as a non-root user, and uses a read-only container filesystem. Put a TLS-terminating reverse proxy in front of the loopback port; do not expose plain HTTP publicly. Do not replace unrelated VPS/Nginx configuration—integrate a site-specific proxy only after reviewing the existing host setup. `/health` is a minimal public liveness endpoint. API docs are disabled by default; `AI_GATEWAY_EXPOSE_DOCS=true` enables them and should generally remain off on public deployments.
 
-- AI mode-এ **প্রতিটি অনুমোদিত incoming message**, সর্বশেষ ৮টি conversation turn পর্যন্ত, এবং সর্বোচ্চ ৩০টি knowledge entry OpenAI API-তে যায়। Sender-এর নাম/ফোন নম্বর পাঠানো হয় না। AI উত্তর আসার পর app-এ per-contact recent context স্থানীয়ভাবে থাকে (সর্বোচ্চ ১০০টি thread); Notification Access-ও সংবেদনশীল অনুমতি। Generative AI switch বন্ধ রাখলে কোনো network call হয় না।
-- OpenAI API key শুধু backend environment-এ থাকে। Backend access token Android-এর app-private preferences-এ রাখা হয়—এটি API key নয়, তবে rooted/compromised ফোনে token বের হতে পারে। Token Git-এ দেবেন না; public APK বিতরণের আগে shared-token auth-এর বদলে per-user/per-device authentication, TLS termination, persistent rate limiting এবং usage quotas যোগ করুন। বর্তমান in-memory rate limit restart হলে reset হয়।
-- Backend prompt message/knowledge/history-কে untrusted data ধরে; model-কে knowledge-ভিত্তিক উত্তর দিতে ও যথেষ্ট তথ্য না থাকলে নীরব থাকতে নির্দেশ দেওয়া হয়। Generative AI তবুও ভুল উত্তর দিতে পারে; গুরুত্বপূর্ণ তথ্য নিজে যাচাই করুন।
-- WhatsApp notification-এ sender/message যেমন আসে তার ওপরই নিয়ম চলে; group, media, hidden notification বা WhatsApp/Android update-এ আচরণ বদলাতে পারে। Reply action না থাকলে উত্তর যাবে না।
-- একই WhatsApp app-এর ভেতরের একাধিক account আলাদাভাবে শনাক্ত করার নিশ্চয়তা নেই; শুধু WhatsApp বনাম WhatsApp Business package নির্বাচন হয়। Cloned/third-party apps সমর্থিত নয়।
-- ব্যক্তিগত WhatsApp call auto-answer/decline এই prototype-এ বাস্তবায়িত নয়। Notification action/API ফোনভেদে অনির্ভরযোগ্য; কোনো কল ধরবে বা কাটবে না।
+4. In Android settings, enter the public **HTTPS root URL** and the `APP_ACCESS_TOKEN`, save settings, then enable Generative AI. Incoming messages, recent context, and knowledge context are sent to the configured backend providers when AI mode is enabled. Test first with a private, non-critical chat. The manual image feature requires the user to select a file and tap an OCR or image-understanding button.
 
-## যাচাই
+### Admin API and monitoring
 
-Backend test চালাতে আগে `python -m pip install -r backend/requirements.txt`, তারপর `python -m unittest discover -s backend/tests` চালান। Android build/device test-এর জন্য Android Studio, JDK ও SDK প্রয়োজন।
+Admin routes require `Authorization: Bearer $ADMIN_ACCESS_TOKEN`; app routes require `APP_ACCESS_TOKEN`. Do not use the app token for administration. Key-add requests accept the secret once, encrypt it in SQLite, and never return the clear key. Example key operation (send only over trusted HTTPS):
+
+```bash
+curl -X POST "$BASE/api/admin/providers/gemini-primary/keys" \
+  -H "Authorization: Bearer $ADMIN_ACCESS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"api_key":"...","project_id":"google-cloud-project-id","label":"production key"}'
+```
+
+Use `/api/admin/providers` to inspect provider/key metadata, `/api/admin/fallback-order` to change task-specific order, `/api/admin/settings` for failover and configured request/spend limits, `/api/ai/status` for app-safe provider health/configuration, and `/api/ai/usage` for administrator-only metadata usage and error summaries. Usage records are designed to avoid prompts, messages, image bytes, and API secrets. Price estimates are only as accurate as the configured price table; unknown costs remain unknown. The included rate limit is in-memory and per IP/process, not a substitute for edge-level abuse protection or durable quotas.
+
+Image endpoints are `POST /api/ai/extract-image` and `POST /api/ai/understand-image`, authenticated with the app token and multipart field `file`; image understanding additionally accepts `question`, `knowledge_json`, and `history_json`. Accepted formats are JPEG, PNG, WEBP, and PDF, with an 8 MiB default maximum (configurable up to 20 MiB). OCR returns normalized extracted text, language, status, warnings and uncertainty; it does not invent a numeric confidence score.
+
+## Android build and setup
+
+1. Use Android Studio, JDK 17, Android SDK 35 and Gradle 8.9 (AGP 8.7.3). The checkout does not contain Gradle wrapper files; use a compatible local Gradle or generate a wrapper locally, then sync and build the `app` configuration.
+2. Install the app, grant Notification Access in Android Settings, select the WhatsApp package, configure sender rules and add knowledge entries. Auto-reply starts off.
+3. For AI replies, configure HTTPS backend URL/token, save, then enable Generative AI and the master auto-reply switch. The app does not send replies when the AI path fails or returns no answer. Local TF-IDF mode remains available when Generative AI is off.
+4. For OCR/vision, use the explicit image/PDF picker and tap the desired action. The upload is limited to 8 MiB in the app and is sent only after that explicit selection/action.
+
+## Operations, data and rollback
+
+- Keep `backend/.env`, database backups, Fernet key backups and TLS/private-key material outside Git with restrictive permissions. Do not print secrets into logs. Rotate a leaked provider key at its provider and disable/delete the old gateway key; rotate the backend tokens independently. Back up the encrypted SQLite volume and its matching Fernet key together.
+- To update, back up the named `ai-gateway-data` volume and environment file, then run `docker compose -f compose.yaml up -d --build`. Review `/health`, `/api/ai/status`, usage summaries and container logs (which must not contain prompts or secrets). No live provider connectivity is asserted by this repository's mocked tests.
+- To roll back, stop the service, deploy the previously built image/tag and restore the matching database-volume backup if the new release changed schema/data. Keep the prior image and backup until verification. Do not use `docker compose down -v` unless intentionally deleting all gateway state; that deletes keys/configuration/usage in the named volume. This guide does not deploy to a VPS or modify any server configuration.
+- Uploaded image bytes are processed from memory and are not intentionally written to disk by the application. Providers necessarily receive the content for OCR/vision processing under their own service terms; select only material you are authorized to transmit.
+- The backend stores provider keys added through the admin API encrypted at rest with Fernet. Environment variables and process memory still contain secrets during use. Database permissions, backups, host security and encryption-key management remain operator responsibilities.
+- AI can produce incorrect results. Ground responses in the configured knowledge base; validate important information. The app's inline-reply authorization flow remains the only WhatsApp-send mechanism.
+
+## Tests
+
+Install backend dependencies with `python -m pip install -r backend/requirements.txt` and run mocked unit/API tests:
+
+```bash
+python -m unittest discover -s backend/tests -v
+```
+
+These tests do not call external providers and do not prove API credentials, provider connectivity, Android compilation, Docker image build, or deployment. Android build/device tests require Android Studio, JDK and SDK.
