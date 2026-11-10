@@ -37,7 +37,7 @@ class RateLimiter:
         if self.backend not in {"memory", "redis"}:
             raise RuntimeError("RATE_LIMIT_BACKEND must be 'memory' or 'redis'")
         self.window = max(1, int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")))
-        self.key_prefix = os.getenv("RATE_LIMIT_KEY_PREFIX", "ai-gateway").strip().strip(":") or "ai-gateway"
+        self.key_prefix = os.getenv("RATE_LIMIT_KEY_PREFIX", "whatsapp_autoresponder").strip().strip(":") or "whatsapp_autoresponder"
         if len(self.key_prefix) > 80 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:_-" for char in self.key_prefix):
             raise RuntimeError("RATE_LIMIT_KEY_PREFIX contains unsupported characters")
         self._lock = threading.Lock()

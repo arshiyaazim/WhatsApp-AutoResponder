@@ -14,7 +14,7 @@ This is not an official WhatsApp integration or a production-certified app. AI o
 
 ## Deployment architecture
 
-Only two Compose services are required: `ai-gateway` (FastAPI + persistent SQLite) and `rate-limit` (private Redis). The gateway binds to loopback, has readiness/liveness checks, upload/TMP bounds, conservative daily budget reservations and container resource/log limits. Redis is not published. Existing Nginx and HTTPS are reused after a VPS compatibility review; this repository does not replace host configuration.
+Only two Compose services are required: `ai-gateway` (FastAPI + persistent SQLite) and a dedicated `rate-limit` (private Redis). Compose uses a unique project namespace (`whatsapp_autoresponder` by default) for its containers, networks and named volumes; choose another unused name if discovery finds a collision. SQLite and Redis data use separate project-scoped named volumes, Redis has no published port, and its keys use the `whatsapp_autoresponder:` namespace. The gateway binds to loopback, with a configurable port that must be checked against existing listeners. Existing Nginx and HTTPS are reused only after VPS compatibility review; no existing host configuration or application is modified by these files.
 
 A single non-secret root `.env` configures the project, immutable image tag, models and limits. `scripts/init-secrets.sh` creates unique app/admin tokens, a Fernet key and provider JSON files under ignored `secrets/`. Local Compose mounts those secret files read-only; protect the host directory and back up the Fernet key separately from encrypted SQLite.
 
