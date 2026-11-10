@@ -26,6 +26,8 @@ class MainActivity : Activity() {
     private var settings = AppSettings()
     private var editKnowledgeIndex: Int? = null
     private var editRuleIndex: Int? = null
+    private var selectedImageUri: Uri? = null
+    private var selectedImageStatus: TextView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -141,7 +143,7 @@ class MainActivity : Activity() {
         }
 
         section("৩. Generative AI")
-        text("AI backend URL ও backend access token দিন। OpenAI API key শুধু backend server-এ থাকবে। চালু করলে incoming message, সাম্প্রতিক conversation context এবং knowledge base-এর entry OpenAI-তে পাঠানো হবে।", 13f)
+        text("AI backend HTTPS URL ও backend access token দিন। Gemini/OpenAI/অন্যান্য provider-এর API key শুধু backend server-এ থাকবে। চালু করলে incoming message, সাম্প্রতিক conversation context এবং knowledge entry backend-এর নির্বাচিত provider-এ পাঠানো হবে।", 13f)
         val aiEnabledSwitch = Switch(this).apply {
             text = "Generative AI দিয়ে উত্তর তৈরি"
             isChecked = settings.generativeAiEnabled
@@ -170,7 +172,34 @@ class MainActivity : Activity() {
             }
         }
 
-        section("৪. Knowledge base")
+        section("৪. ছবি থেকে OCR / ছবি বোঝা")
+        text("শুধু আপনি এখানে যে ছবি/PDF বাছাই করবেন সেটিই HTTPS backend-এ পাঠানো হবে। WhatsApp notification থেকে media attachment স্বয়ংক্রিয়ভাবে পড়া যায় না; এই অংশটি manual upload। Generative AI ও backend সেটিংস সক্রিয় থাকতে হবে।", 13f)
+        val imageStatus = TextView(this).apply {
+            text = if (selectedImageUri == null) "কোনো ফাইল বাছাই করা হয়নি" else "ফাইল বাছাই হয়েছে"
+            textSize = 14f
+        }
+        selectedImageStatus = imageStatus
+        root.addView(imageStatus)
+        button("ছবি/PDF বাছাই করুন") {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/jpeg", "image/png", "image/webp", "application/pdf"))
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            }
+            startActivityForResult(intent, REQUEST_IMAGE)
+        }
+        val imageQuestion = input("ছবি সম্পর্কে প্রশ্ন (ঐচ্ছিক)")
+        val imageOutput = TextView(this).apply { textSize = 14f; setPadding(0, dp(4), 0, dp(8)) }
+        root.addView(imageOutput)
+        button("ছবি থেকে লেখা বের করুন (OCR)") {
+            uploadSelectedImage("extract-image", "", imageOutput)
+        }
+        button("ছবিটি বুঝে উত্তর দিন") {
+            uploadSelectedImage("understand-image", imageQuestion.text.toString().trim(), imageOutput)
+        }
+
+        section("৫. Knowledge base")
         text("প্রশ্ন/বিষয় ও নির্দিষ্ট উত্তর যোগ করুন। অ্যাপ স্থানীয় TF‑IDF মিল দিয়ে সেরা উত্তর বেছে নেয়—এটি নিজে থেকে নতুন বাক্য বানানো LLM নয়। মিল যথেষ্ট না হলে চুপ থাকবে।", 13f)
         val question = input("প্রশ্ন বা বিষয়")
         val keywords = input("ঐচ্ছিক কীওয়ার্ড (কমা দিয়ে)")
@@ -235,7 +264,7 @@ class MainActivity : Activity() {
             space(6)
         }
 
-        section("৫. WhatsApp কল")
+        section("৬. WhatsApp কল")
         text("ব্যক্তিগত WhatsApp অ্যাপের incoming call auto-accept/decline করার supported public API নেই। কিছু ফোন/সংস্করণে notification action দেখা গেলেও তা ভরসাযোগ্য বা সব সংস্করণে উন্মুক্ত—এমন নিশ্চয়তা নেই। এই prototype কল নিয়ন্ত্রণ বা নজরদারি করে না; কোনো কল ধরবে বা কাটবে না।", 13f)
         val callToggle = Switch(this).apply {
             text = "কল অটো-হ্যান্ডলিং (অসমর্থিত — নিষ্ক্রিয়)"
@@ -247,6 +276,36 @@ class MainActivity : Activity() {
         }
         root.addView(callToggle)
         text("প্রতিটি পরিবর্তন স্বয়ংক্রিয়ভাবে সেভ হয়।", 12f)
+    }
+
+    private fun uploadSelectedImage(task: String, question: String, output: TextView) {
+        val uri = selectedImageUri
+        if (uri == null) {
+            toast("আগে একটি ছবি/PDF বাছাই করুন")
+            return
+        }
+        val current = SettingsStore.load(this)
+        if (!current.generativeAiEnabled || current.aiBackendUrl.isBlank() || current.aiBackendToken.isBlank()) {
+            toast("আগে Generative AI backend সেটিংস সংরক্ষণ ও চালু করুন")
+            return
+        }
+        output.text = "Backend-এ পাঠানো হচ্ছে…"
+        Thread {
+            try {
+                val response = BackendClient.uploadImage(this, current.aiBackendUrl, current.aiBackendToken,
+                    uri, task, question, current.knowledge)
+                val resultText = if (task == "extract-image") {
+                    val warnings = response.optJSONArray("warnings")
+                    val warningText = warnings?.let { arr -> (0 until arr.length()).joinToString("\n") { "• ${arr.optString(it)}" } }.orEmpty()
+                    "OCR · ${response.optString("language", "unknown")} · ${response.optString("extraction_status", "partial")}\n" +
+                        response.optString("extracted_text").take(12_000) +
+                        if (warningText.isBlank()) "" else "\n\nসতর্কতা:\n$warningText"
+                } else response.optString("answer", "কোনো উত্তর আসেনি")
+                runOnUiThread { output.text = resultText }
+            } catch (e: Exception) {
+                runOnUiThread { output.text = "ছবি প্রক্রিয়া করা যায়নি: ${e.message ?: "backend/network error"}" }
+            }
+        }.start()
     }
 
     private fun updateSettings(value: AppSettings) {
@@ -301,6 +360,15 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_IMPORT && resultCode == Activity.RESULT_OK) data?.data?.let(::importKnowledge)
+        if (requestCode == REQUEST_IMAGE && resultCode == Activity.RESULT_OK) {
+            val uri = data?.data ?: return
+            try {
+                val flags = data.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                contentResolver.takePersistableUriPermission(uri, flags and Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: Exception) { /* Temporary picker permission is enough for this immediate upload. */ }
+            selectedImageUri = uri
+            selectedImageStatus?.text = "ফাইল বাছাই হয়েছে — আপলোড করতে OCR বা image understanding বাটন চাপুন"
+        }
     }
 
     private fun isNotificationAccessEnabled(): Boolean {
@@ -366,5 +434,8 @@ class MainActivity : Activity() {
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     private fun scrollToTop() { (root.parent as? ScrollView)?.smoothScrollTo(0, 0) }
 
-    companion object { private const val REQUEST_IMPORT = 4711 }
+    companion object {
+        private const val REQUEST_IMPORT = 4711
+        private const val REQUEST_IMAGE = 4712
+    }
 }

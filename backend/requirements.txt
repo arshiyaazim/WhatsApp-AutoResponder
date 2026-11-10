@@ -1,4 +1,8 @@
 fastapi>=0.115,<1
 uvicorn[standard]>=0.34,<1
 openai>=1.68,<3
-httpx>=0.28,<1  # FastAPI TestClient used by backend unit tests
+google-genai>=1.0,<2
+anthropic>=0.40,<1
+cryptography>=43,<47
+python-multipart>=0.0.20,<1
+httpx>=0.28,<1  # TestClient for backend tests
