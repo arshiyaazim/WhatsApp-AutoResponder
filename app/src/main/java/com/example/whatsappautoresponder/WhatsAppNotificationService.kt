@@ -3,12 +3,16 @@ package com.example.whatsappautoresponder
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.RemoteInput
+import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
-import android.os.Bundle
 import java.security.MessageDigest
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 class WhatsAppNotificationService : NotificationListenerService() {
+    private val worker: ExecutorService = Executors.newSingleThreadExecutor()
+
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val settings = SettingsStore.load(this)
         if (!settings.autoReplyEnabled || sbn.packageName !in settings.selectedPackages) return
@@ -24,22 +28,53 @@ class WhatsAppNotificationService : NotificationListenerService() {
 
         val (identity, message) = identifyAndExtract(title, body)
         if (message.isBlank() || !ContactPolicy.shouldReply(settings, identity)) return
-        val response = KnowledgeMatcher.answer(message, settings.knowledge) ?: return
-        if (alreadyHandled(sbn, message)) return
 
         val replyAction = sbn.notification.actions
             ?.firstOrNull { action -> action.remoteInputs?.any { it.allowFreeFormInput } == true }
             ?: return
         val remoteInput = replyAction.remoteInputs?.firstOrNull { it.allowFreeFormInput } ?: return
-        try {
+        if (alreadyHandled(sbn, message)) return
+
+        if (settings.generativeAiEnabled) {
+            if (settings.aiBackendUrl.isBlank() || settings.aiBackendToken.isBlank() || settings.knowledge.isEmpty()) return
+            // For small knowledge bases, let the LLM compare every entry semantically. For larger
+            // bases, trim the request to the 30 strongest lexical candidates to bound API cost.
+            val knowledge = if (settings.knowledge.size <= 30) settings.knowledge
+                else KnowledgeMatcher.topEntries(message, settings.knowledge, limit = 30)
+            if (knowledge.isEmpty()) return
+            val threadId = ConversationStore.threadId(sbn.packageName, identity.ifBlank { sbn.key })
+            worker.execute {
+                val history = ConversationStore.recentHistory(this@WhatsAppNotificationService, threadId)
+                val response = BackendClient.generateReply(
+                    settings.aiBackendUrl,
+                    settings.aiBackendToken,
+                    message,
+                    knowledge,
+                    history
+                ) ?: return@execute
+                if (sendReply(replyAction, remoteInput, response)) {
+                    ConversationStore.appendExchange(this@WhatsAppNotificationService, threadId, message, response)
+                }
+            }
+        } else {
+            val response = KnowledgeMatcher.answer(message, settings.knowledge) ?: return
+            sendReply(replyAction, remoteInput, response)
+        }
+    }
+
+    private fun sendReply(action: Notification.Action, remoteInput: RemoteInput, response: String): Boolean {
+        return try {
             val fillIn = android.content.Intent()
             val results = Bundle().apply { putCharSequence(remoteInput.resultKey, response) }
             RemoteInput.addResultsToIntent(arrayOf(remoteInput), fillIn, results)
-            replyAction.actionIntent.send(this, 0, fillIn)
+            action.actionIntent.send(this, 0, fillIn)
+            true
         } catch (_: PendingIntent.CanceledException) {
             // The WhatsApp notification may have expired before the reply action was sent.
+            false
         } catch (_: SecurityException) {
             // Android / WhatsApp can reject a reply action; no attempt is made to bypass it.
+            false
         }
     }
 
@@ -62,5 +97,10 @@ class WhatsAppNotificationService : NotificationListenerService() {
         if (now - last < 10 * 60 * 1000L) return true
         prefs.edit().putLong(key, now).apply()
         return false
+    }
+
+    override fun onDestroy() {
+        worker.shutdownNow()
+        super.onDestroy()
     }
 }
