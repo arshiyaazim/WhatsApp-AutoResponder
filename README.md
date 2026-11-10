@@ -1,39 +1,52 @@
-# WhatsApp Auto Responder — Android companion prototype
+# WhatsApp Auto Responder — Android companion + AI gateway prototype
 
-এই repository-টি পুরোনো Python 2/WhatsApp Web bot থেকে Android companion-app prototype-এ রূপান্তর করা হচ্ছে। Android অ্যাপটি ফোনে আলাদাভাবে ইনস্টল করতে হবে; WhatsApp-এর কোনো APK পরিবর্তন বা account login/session চুরি করে না। **এটি এখনো পরীক্ষামূলক, production-ready নয়।**
+Android companion app-টি notification থেকে message পড়ে, বাছাই করা knowledge base ও ঐচ্ছিক Generative AI backend দিয়ে reply তৈরি করার চেষ্টা করে। এটি পরীক্ষামূলক; production-ready বা WhatsApp-এর official integration নয়।
 
-## কী আছে
+## ফিচার
 
-- অটো-রিপ্লে এবং প্রতিটি সমর্থিত WhatsApp অ্যাপের জন্য আলাদা on/off নির্বাচন। বর্তমানে WhatsApp (`com.whatsapp`) ও WhatsApp Business (`com.whatsapp.w4b`) শনাক্ত করা হয়।
-- contact/name/number rule যোগ, edit, delete; Allowlist mode এবং deny-first নীতি।
-- UI থেকে knowledge entry যোগ, edit, delete; JSON knowledge base ইমপোর্ট।
-- স্থানীয় TF-IDF/cosine lexical retrieval দিয়ে knowledge base থেকে উত্তর বাছাই। উত্তর না মিললে চুপ থাকে। কোনো message বা knowledge বাইরের server-এ পাঠানো হয় না।
-- WhatsApp-এর notification-এ inline reply action থাকলে সেটি ব্যবহার করে উত্তর পাঠানোর চেষ্টা। Android Notification Access ব্যবহারকারীকে নিজে Settings-এ গিয়ে অনুমোদন করতে হবে।
+- WhatsApp (`com.whatsapp`) ও WhatsApp Business (`com.whatsapp.w4b`) app package নির্বাচন, master auto-reply switch এবং sender Allow/Deny rule CRUD ও Allowlist mode।
+- UI-তে knowledge entry add/edit/delete এবং JSON import। নমুনা: `knowledge_base.example.json`।
+- **Local mode:** internet/API ছাড়াই local TF-IDF শব্দ-মিল; মিল না পেলে reply নয়।
+- **Generative AI mode:** Android app HTTPS-এ নিজের backend-এ request পাঠায়। Backend OpenAI Responses API-তে message, সাম্প্রতিক conversation এবং knowledge base পাঠিয়ে উত্তর তৈরি করে। Model-এর কাছে অপ্রাসঙ্গিক/অপর্যাপ্ত knowledge হলে `[NO_REPLY]` ফেরত দিতে বলা হয়। ৩০টি বা কম knowledge entry হলে সবগুলো context হিসেবে যায়; ৩০টির বেশি হলে app স্থানীয় lexical matcher দিয়ে সেরা ৩০টি বেছে নেয়।
+- WhatsApp notification-এ inline reply action পাওয়া গেলেই উত্তর পাঠানোর চেষ্টা হয়। Android Notification Access ব্যবহারকারীকে নিজে অনুমতি দিতে হবে।
 
-`knowledge_base.example.json` থেকে নমুনা JSON ইমপোর্ট করা যায়। ফাইলের ধরন:
+## Generative AI backend চালানো
 
-```json
-[
-  {"question": "দোকান কখন খোলা?", "answer": "সকাল ৯টা থেকে বিকেল ৫টা।", "keywords": "সময়, খোলার সময়"}
-]
-```
+OpenAI API key **কখনো Android app বা Git-এ রাখবেন না**. Backend-এ OpenAI key server environment secret হিসেবে থাকে; Android-এ আলাদা backend access token বসে। ChatGPT Plus সাবস্ক্রিপশন API usage-এর খরচ অন্তর্ভুক্ত করে না—API billing আলাদা।
 
-## চালানো
+1. Python 3.12 ও Docker ব্যবহার করুন। `backend/.env.example` কপি করে `backend/.env` বানান এবং server-এ secret হিসেবে সেট করুন:
+   - `OPENAI_API_KEY` — OpenAI API key
+   - `OPENAI_MODEL` — ডিফল্ট `gpt-4.1-mini`
+   - `APP_ACCESS_TOKEN` — শক্তিশালী random token (উদাহরণ: `openssl rand -hex 32`)
+   - ঐচ্ছিক `REQUESTS_PER_MINUTE` — IP-প্রতি rate limit, ডিফল্ট ২০
+2. Project root থেকে চালান:
 
-1. Android Studio, JDK 17, Android SDK 35 এবং Gradle 8.9 ব্যবহার করুন (AGP 8.7.3)। এই checkout-এ Gradle wrapper নেই; local Gradle দিয়ে project sync/build করুন, অথবা project root-এ `gradle wrapper --gradle-version 8.9` চালিয়ে wrapper তৈরি করুন। তারপর Android Studio-তে project খুলে `app` configuration চালান।
-2. Android ফোনে অ্যাপ ইনস্টল করুন। **নোটিফিকেশন অ্যাক্সেস** বাটনে চাপ দিয়ে Android Settings থেকে এই অ্যাপকে অনুমতি দিন।
-3. কোন WhatsApp ইনস্টলেশন চলবে, অটো-রিপ্লে, contact rules এবং knowledge base সেট করুন। প্রথমে নিজের/পরীক্ষামূলক chat-এ পরীক্ষা করুন।
-4. অটো-রিপ্লে চালু করার পর Android ব্যাটারি/ব্যাকগ্রাউন্ড সীমাবদ্ধতায় notification service থেমে যেতে পারে; নির্মাতা-নির্দিষ্ট battery optimization আচরণও পরীক্ষা করুন।
+   ```bash
+   docker build -t wa-auto-responder-ai ./backend
+   docker run --rm --env-file backend/.env -p 8000:8000 wa-auto-responder-ai
+   ```
 
-## বাস্তবায়নের সীমা ও নিরাপত্তা
+3. Android app-এ **Generative AI** চালু করে backend-এর **HTTPS root URL** (যেমন `https://your-host.example`) ও একই `APP_ACCESS_TOKEN` লিখে **AI সেটিংস সংরক্ষণ** করুন। Public deployment-এ TLS/HTTPS বাধ্যতামূলক; Android client HTTP গ্রহণ করে না। `/health` endpoint দিয়ে backend health পরীক্ষা করা যায়।
+4. OpenAI usage, rate limits ও hosting bill পর্যবেক্ষণ করুন। Test-এর জন্য প্রথমে অল্প কয়েকটি knowledge entry ও নিজের chat ব্যবহার করুন।
 
-- **একই WhatsApp অ্যাপের ভিতরের একাধিক account:** Android notification সাধারণত কোন account/profile-এ message এসেছে তা নির্ভরযোগ্যভাবে দেয় না। এই prototype অ্যাপ-প্যাকেজ (WhatsApp বনাম WhatsApp Business) নির্বাচন করে; একই package-এর account-গুলোর মধ্যে নিশ্চিতভাবে বাছাই করতে পারে না। Dual-app/cloned/third-party WhatsApp installation সমর্থিত নয়।
-- **নোটিফিকেশন-নির্ভর:** sender নাম/নম্বর ও message text notification-এ যেমন পাওয়া যায়, তার ওপরই নিয়ম চলে। লুকানো/সংক্ষিপ্ত/ভিন্ন ভাষার notification, media, group notification এবং WhatsApp-এর ভবিষ্যৎ পরিবর্তনে কাজ নাও করতে পারে। নম্বর না দেখালে নম্বর-ভিত্তিক rule মিলবে না—সেক্ষেত্রে notification-এ থাকা নাম দিয়ে rule দিন।
-- **রিপ্লে পাঠানো নিশ্চিত নয়:** Android/WhatsApp reply action না দিলে, notification বন্ধ/মেয়াদোত্তীর্ণ হলে বা OS আটকালে কোনো উত্তর যাবে না। কোনো UI automation/accessibility workaround ব্যবহার করা হয়নি।
-- **Knowledge base এখন LLM নয়:** স্থানীয় TF-IDF মূলত শব্দের মিল ধরে; প্রকৃত semantic understanding, conversation history, generative AI, hallucination guard বা ভাষাভিত্তিক embedding নেই। এগুলো চাইলে ভবিষ্যতে ঐচ্ছিক/স্ব-হোস্টেড AI backend যোগ করা যাবে—তখন message বাইরের মডেলে পাঠানোর আগে consent ও privacy policy প্রয়োজন।
-- **WhatsApp কল auto-accept/decline:** ব্যক্তিগত WhatsApp app-এর কল নিয়ন্ত্রণে এই ব্যবহারের জন্য supported public API নেই। Android notification-এ কোনো সংস্করণে call action দেখা যেতে পারে, কিন্তু WhatsApp/Android তা third-party app-কে সবসময় expose করবে বা action চালাতে দেবে—এমন নিশ্চয়তা নেই। WhatsApp Business Platform-এর business calling আলাদা service; সেটি ফোনে থাকা personal account নিয়ন্ত্রণের API নয়। তাই prototype-এ কল স্বয়ংক্রিয়ভাবে ধরা/কাটা **বাস্তবায়িত নয়**। Accessibility দিয়ে UI tap করানো ভঙ্গুর, device/WhatsApp সংস্করণনির্ভর এবং নিরাপদ/নির্ভরযোগ্য সমাধান হিসেবে উপস্থাপন করা যাবে না।
-- Notification Access সংবেদনশীল অনুমতি। message text স্থানীয় knowledge lookup ও inline reply-এর জন্য প্রক্রিয়া হয়; raw message log বা cloud upload নেই। duplicate reply ঠেকাতে message-ভিত্তিক hash ও timestamp local preferences-এ রাখা হয়। তবু আলাদা পরীক্ষামূলক ফোনে ব্যবহার করুন।
+Local mode ব্যবহার করতে Generative AI switch বন্ধ রাখুন। AI mode-এ backend unavailable, token ভুল বা knowledge খালি থাকলে local fallback হবে না—অ্যাপ নীরব থাকবে।
 
-## বর্তমান repository
+## Android app তৈরি ও সেটআপ
 
-পুরোনো Python 2/Selenium WhatsApp Web bot অচল selector ও obsolete dependency-র ওপর নির্ভর করত, তাই Android prototype-এ বিভ্রান্তি না ঘটাতে তা সরানো হয়েছে। এই branch-এ করা পরিবর্তন বর্তমান remote-এ স্বয়ংক্রিয়ভাবে push করা হয়নি। আলাদা GitHub repository-তে প্রকাশ করতে হলে destination repository-র নাম ও public/private পছন্দ জানাতে হবে।
+1. Android Studio, JDK 17, Android SDK 35, Gradle 8.9 (AGP 8.7.3) ব্যবহার করুন। এই checkout-এ Gradle wrapper নেই; local Gradle দিয়ে project sync/build করুন, অথবা `gradle wrapper --gradle-version 8.9` project root-এ চালিয়ে wrapper তৈরি করে Android Studio-তে project খুলুন, Gradle sync করুন, তারপর `app` configuration চালান।
+2. ফোনে অ্যাপ install করে **নোটিফিকেশন অ্যাক্সেস সেট করুন** চাপুন এবং Android Settings-এ Notification Access অনুমোদন করুন।
+3. কোন WhatsApp app থেকে কাজ করবে বাছুন; sender Allow/Deny rules ও knowledge base সেট করুন। অটো-রিপ্লে শুরুতে বন্ধ থাকে।
+4. Generative AI ব্যবহার করলে backend URL/token save করুন; তারপর AI switch ও master auto-reply switch চালু করুন। প্রথমে পরীক্ষামূলক chat-এ পরীক্ষা করুন।
+
+## ডেটা, privacy ও নিরাপত্তা
+
+- AI mode-এ **প্রতিটি অনুমোদিত incoming message**, সর্বশেষ ৮টি conversation turn পর্যন্ত, এবং সর্বোচ্চ ৩০টি knowledge entry OpenAI API-তে যায়। Sender-এর নাম/ফোন নম্বর পাঠানো হয় না। AI উত্তর আসার পর app-এ per-contact recent context স্থানীয়ভাবে থাকে (সর্বোচ্চ ১০০টি thread); Notification Access-ও সংবেদনশীল অনুমতি। Generative AI switch বন্ধ রাখলে কোনো network call হয় না।
+- OpenAI API key শুধু backend environment-এ থাকে। Backend access token Android-এর app-private preferences-এ রাখা হয়—এটি API key নয়, তবে rooted/compromised ফোনে token বের হতে পারে। Token Git-এ দেবেন না; public APK বিতরণের আগে shared-token auth-এর বদলে per-user/per-device authentication, TLS termination, persistent rate limiting এবং usage quotas যোগ করুন। বর্তমান in-memory rate limit restart হলে reset হয়।
+- Backend prompt message/knowledge/history-কে untrusted data ধরে; model-কে knowledge-ভিত্তিক উত্তর দিতে ও যথেষ্ট তথ্য না থাকলে নীরব থাকতে নির্দেশ দেওয়া হয়। Generative AI তবুও ভুল উত্তর দিতে পারে; গুরুত্বপূর্ণ তথ্য নিজে যাচাই করুন।
+- WhatsApp notification-এ sender/message যেমন আসে তার ওপরই নিয়ম চলে; group, media, hidden notification বা WhatsApp/Android update-এ আচরণ বদলাতে পারে। Reply action না থাকলে উত্তর যাবে না।
+- একই WhatsApp app-এর ভেতরের একাধিক account আলাদাভাবে শনাক্ত করার নিশ্চয়তা নেই; শুধু WhatsApp বনাম WhatsApp Business package নির্বাচন হয়। Cloned/third-party apps সমর্থিত নয়।
+- ব্যক্তিগত WhatsApp call auto-answer/decline এই prototype-এ বাস্তবায়িত নয়। Notification action/API ফোনভেদে অনির্ভরযোগ্য; কোনো কল ধরবে বা কাটবে না।
+
+## যাচাই
+
+Backend test চালাতে আগে `python -m pip install -r backend/requirements.txt`, তারপর `python -m unittest discover -s backend/tests` চালান। Android build/device test-এর জন্য Android Studio, JDK ও SDK প্রয়োজন।

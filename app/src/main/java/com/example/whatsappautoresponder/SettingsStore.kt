@@ -14,6 +14,9 @@ data class AppSettings(
     val allowlistOnly: Boolean = false,
     val rules: List<ContactRule> = emptyList(),
     val knowledge: List<KnowledgeEntry> = emptyList(),
+    val generativeAiEnabled: Boolean = false,
+    val aiBackendUrl: String = "",
+    val aiBackendToken: String = "",
     // Retained for a future supported integration. The notification API cannot execute call actions.
     val callAutomationEnabled: Boolean = false,
     val callAction: String = "observe"
@@ -47,6 +50,9 @@ object SettingsStore {
                 allowlistOnly = root.optBoolean("allowlistOnly", false),
                 rules = rules,
                 knowledge = entries,
+                generativeAiEnabled = root.optBoolean("generativeAiEnabled", false),
+                aiBackendUrl = root.optString("aiBackendUrl", ""),
+                aiBackendToken = root.optString("aiBackendToken", ""),
                 callAutomationEnabled = root.optBoolean("callAutomationEnabled", false),
                 callAction = root.optString("callAction", "observe")
             )
@@ -68,6 +74,9 @@ object SettingsStore {
                     put(JSONObject().put("question", it.question).put("answer", it.answer).put("keywords", it.keywords))
                 }
             })
+            .put("generativeAiEnabled", settings.generativeAiEnabled)
+            .put("aiBackendUrl", settings.aiBackendUrl)
+            .put("aiBackendToken", settings.aiBackendToken)
             .put("callAutomationEnabled", settings.callAutomationEnabled)
             .put("callAction", settings.callAction)
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, root.toString()).apply()
@@ -102,10 +111,18 @@ object KnowledgeMatcher {
     private val tokenPattern = Regex("[\\p{L}\\p{N}]+", RegexOption.IGNORE_CASE)
 
     fun answer(query: String, entries: List<KnowledgeEntry>, minimumScore: Double = 0.12): String? {
-        if (query.isBlank() || entries.isEmpty()) return null
+        val best = ranked(query, entries).firstOrNull() ?: return null
+        return if (best.second >= minimumScore) best.first.answer else null
+    }
+
+    fun topEntries(query: String, entries: List<KnowledgeEntry>, limit: Int = 10): List<KnowledgeEntry> =
+        ranked(query, entries).take(limit.coerceAtLeast(0)).map { it.first }
+
+    private fun ranked(query: String, entries: List<KnowledgeEntry>): List<Pair<KnowledgeEntry, Double>> {
+        if (query.isBlank() || entries.isEmpty()) return emptyList()
         val docs = entries.map { tokenize("${it.question} ${it.keywords}") }
         val queryTerms = tokenize(query)
-        if (queryTerms.isEmpty()) return null
+        if (queryTerms.isEmpty()) return emptyList()
         val vocabulary = (docs.flatten() + queryTerms).toSet()
         val documentFrequency = vocabulary.associateWith { term -> docs.count { term in it } }
         fun vector(tokens: List<String>): Map<String, Double> {
@@ -117,14 +134,13 @@ object KnowledgeMatcher {
         }
         val queryVector = vector(queryTerms)
         val queryNorm = kotlin.math.sqrt(queryVector.values.sumOf { it * it })
-        if (queryNorm == 0.0) return null
-        val best = entries.indices.map { index ->
+        if (queryNorm == 0.0) return emptyList()
+        return entries.indices.map { index ->
             val docVector = vector(docs[index])
             val docNorm = kotlin.math.sqrt(docVector.values.sumOf { it * it })
             val dot = queryVector.entries.sumOf { (term, weight) -> weight * (docVector[term] ?: 0.0) }
-            index to if (docNorm == 0.0) 0.0 else dot / (queryNorm * docNorm)
-        }.maxByOrNull { it.second } ?: return null
-        return if (best.second >= minimumScore) entries[best.first].answer else null
+            entries[index] to if (docNorm == 0.0) 0.0 else dot / (queryNorm * docNorm)
+        }.sortedByDescending { it.second }
     }
 
     private fun tokenize(text: String): List<String> = tokenPattern.findAll(text.lowercase(Locale.ROOT)).map { it.value }.toList()

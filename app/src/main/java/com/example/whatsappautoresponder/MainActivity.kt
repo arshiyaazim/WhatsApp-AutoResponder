@@ -140,7 +140,37 @@ class MainActivity : Activity() {
             root.addView(line)
         }
 
-        section("৩. Knowledge base")
+        section("৩. Generative AI")
+        text("AI backend URL ও backend access token দিন। OpenAI API key শুধু backend server-এ থাকবে। চালু করলে incoming message, সাম্প্রতিক conversation context এবং knowledge base-এর entry OpenAI-তে পাঠানো হবে।", 13f)
+        val aiEnabledSwitch = Switch(this).apply {
+            text = "Generative AI দিয়ে উত্তর তৈরি"
+            isChecked = settings.generativeAiEnabled
+        }
+        root.addView(aiEnabledSwitch)
+        val backendUrlInput = input("HTTPS backend URL (যেমন https://ai.example.com)").apply {
+            setText(settings.aiBackendUrl)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
+        }
+        val backendTokenInput = input("Backend access token").apply {
+            setText(settings.aiBackendToken)
+            transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
+        }
+        button("AI সেটিংস সংরক্ষণ") {
+            val url = backendUrlInput.text.toString().trim().trimEnd('/')
+            val token = backendTokenInput.text.toString().trim()
+            if (aiEnabledSwitch.isChecked && (!url.startsWith("https://") || token.isBlank())) {
+                toast("AI চালাতে HTTPS backend URL এবং access token দিন")
+            } else {
+                updateSettings(settings.copy(
+                    generativeAiEnabled = aiEnabledSwitch.isChecked,
+                    aiBackendUrl = url,
+                    aiBackendToken = token
+                ))
+                toast("AI backend সেটিংস সেভ হয়েছে")
+            }
+        }
+
+        section("৪. Knowledge base")
         text("প্রশ্ন/বিষয় ও নির্দিষ্ট উত্তর যোগ করুন। অ্যাপ স্থানীয় TF‑IDF মিল দিয়ে সেরা উত্তর বেছে নেয়—এটি নিজে থেকে নতুন বাক্য বানানো LLM নয়। মিল যথেষ্ট না হলে চুপ থাকবে।", 13f)
         val question = input("প্রশ্ন বা বিষয়")
         val keywords = input("ঐচ্ছিক কীওয়ার্ড (কমা দিয়ে)")
@@ -205,7 +235,7 @@ class MainActivity : Activity() {
             space(6)
         }
 
-        section("৪. WhatsApp কল")
+        section("৫. WhatsApp কল")
         text("ব্যক্তিগত WhatsApp অ্যাপের incoming call auto-accept/decline করার supported public API নেই। কিছু ফোন/সংস্করণে notification action দেখা গেলেও তা ভরসাযোগ্য বা সব সংস্করণে উন্মুক্ত—এমন নিশ্চয়তা নেই। এই prototype কল নিয়ন্ত্রণ বা নজরদারি করে না; কোনো কল ধরবে বা কাটবে না।", 13f)
         val callToggle = Switch(this).apply {
             text = "কল অটো-হ্যান্ডলিং (অসমর্থিত — নিষ্ক্রিয়)"
