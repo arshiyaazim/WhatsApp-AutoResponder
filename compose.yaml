@@ -1,26 +1,100 @@
 services:
   ai-gateway:
+    image: whatsapp-ai-gateway:${AI_GATEWAY_IMAGE_TAG:-local}
     build:
       context: ./backend
+    environment:
+      DATABASE_PATH: /data/ai_gateway.sqlite3
+      RATE_LIMIT_BACKEND: redis
+      RATE_LIMIT_REDIS_URL: redis://rate-limit:6379/0
+      RATE_LIMIT_KEY_PREFIX: ${RATE_LIMIT_KEY_PREFIX:-ai-gateway}
+      APP_ACCESS_TOKEN_FILE: /run/secrets/app_access_token
+      ADMIN_ACCESS_TOKEN_FILE: /run/secrets/admin_access_token
+      PROVIDER_ENCRYPTION_KEY_FILE: /run/secrets/provider_encryption_key
+      PROVIDER_ENCRYPTION_PREVIOUS_KEYS_JSON_FILE: /run/secrets/provider_encryption_previous_keys
+      GEMINI_API_KEYS_JSON_FILE: /run/secrets/gemini_api_keys
+      OPENAI_API_KEYS_JSON_FILE: /run/secrets/openai_api_keys
+      ANTHROPIC_API_KEYS_JSON_FILE: /run/secrets/anthropic_api_keys
+      CUSTOM_OPENAI_API_KEYS_JSON_FILE: /run/secrets/custom_openai_api_keys
     env_file:
       - ./backend/.env
     restart: unless-stopped
+    depends_on:
+      rate-limit:
+        condition: service_healthy
+    networks:
+      - default
+      - gateway-private
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${AI_GATEWAY_HOST_PORT:-8000}:8000"
     volumes:
       - ai-gateway-data:/data
+    secrets:
+      - app_access_token
+      - admin_access_token
+      - provider_encryption_key
+      - provider_encryption_previous_keys
+      - gemini_api_keys
+      - openai_api_keys
+      - anthropic_api_keys
+      - custom_openai_api_keys
     read_only: true
     tmpfs:
-      - /tmp:size=16m,noexec,nosuid
+      - /tmp:size=20m,noexec,nosuid,nodev
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 15s
+
+  rate-limit:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--save", "60", "1", "--maxmemory", "64mb", "--maxmemory-policy", "noeviction"]
+    restart: unless-stopped
+    volumes:
+      - rate-limit-data:/data
+    networks:
+      - gateway-private
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 volumes:
   ai-gateway-data:
+  rate-limit-data:
+
+networks:
+  gateway-private:
+    internal: true
+
+secrets:
+  app_access_token:
+    file: ${APP_ACCESS_TOKEN_SECRET_FILE:-./secrets/app_access_token}
+  admin_access_token:
+    file: ${ADMIN_ACCESS_TOKEN_SECRET_FILE:-./secrets/admin_access_token}
+  provider_encryption_key:
+    file: ${PROVIDER_ENCRYPTION_KEY_SECRET_FILE:-./secrets/provider_encryption_key}
+  provider_encryption_previous_keys:
+    file: ${PROVIDER_ENCRYPTION_PREVIOUS_KEYS_SECRET_FILE:-./secrets/provider_encryption_previous_keys.json}
+  gemini_api_keys:
+    file: ${GEMINI_API_KEYS_SECRET_FILE:-./secrets/gemini_api_keys.json}
+  openai_api_keys:
+    file: ${OPENAI_API_KEYS_SECRET_FILE:-./secrets/openai_api_keys.json}
+  anthropic_api_keys:
+    file: ${ANTHROPIC_API_KEYS_SECRET_FILE:-./secrets/anthropic_api_keys.json}
+  custom_openai_api_keys:
+    file: ${CUSTOM_OPENAI_API_KEYS_SECRET_FILE:-./secrets/custom_openai_api_keys.json}

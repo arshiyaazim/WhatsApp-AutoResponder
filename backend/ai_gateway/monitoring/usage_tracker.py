@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import uuid
@@ -26,9 +27,14 @@ class UsageTracker:
         if not isinstance(rates, dict) or result.input_tokens is None or result.output_tokens is None:
             return None
         try:
-            return ((result.input_tokens * float(rates["input_per_million"])) +
-                    (result.output_tokens * float(rates["output_per_million"]))) / 1_000_000
-        except (KeyError, TypeError, ValueError):
+            input_rate = float(rates["input_per_million"])
+            output_rate = float(rates["output_per_million"])
+            if (result.input_tokens < 0 or result.output_tokens < 0 or input_rate < 0 or output_rate < 0 or
+                    not math.isfinite(input_rate) or not math.isfinite(output_rate)):
+                return None
+            cost = ((result.input_tokens * input_rate) + (result.output_tokens * output_rate)) / 1_000_000
+            return cost if math.isfinite(cost) else None
+        except (KeyError, TypeError, ValueError, OverflowError):
             return None
 
     def record(self, *, request_id: str, task: Task, provider_id: str | None, model: str | None,
@@ -44,16 +50,25 @@ class UsageTracker:
             "output_tokens": result.output_tokens if result else None,
             "estimated_cost_usd": cost, "error_category": category, "fallback_count": fallback_count,
         })
+        # Any provider error other than a clear pre-execution rejection may already be billable.
+        if outcome == "error" and category not in {"authentication", "permission", "invalid_request"}:
+            self.store.mark_budget_uncertain(request_id)
+        elif outcome == "success" and provider_id != "local-tfidf" and cost is None:
+            if self.store.get_settings().get("max_daily_spend_usd") not in (None, ""):
+                self.store.mark_budget_uncertain(request_id)
 
-    def check_budget(self) -> None:
-        settings = self.store.get_settings()
-        usage = self.store.daily_usage()
-        if usage["requests"] >= int(settings.get("max_requests_per_day", 1000)):
-            raise BudgetExceeded("request_budget_exhausted", "Daily AI request limit reached", 429)
-        budget = settings.get("max_daily_spend_usd")
-        if budget not in (None, "") and usage["estimated_spend_usd"] is not None:
-            if float(usage["estimated_spend_usd"]) >= float(budget):
-                raise BudgetExceeded("spending_budget_exhausted", "Daily AI spending limit reached", 429)
+    def check_budget(self, request_id: str) -> None:
+        allowed, category = self.store.reserve_budget(request_id)
+        if not allowed:
+            messages = {
+                "request_budget_exhausted": "Daily AI request limit reached",
+                "spending_budget_exhausted": "Daily AI spending limit reached or reserved",
+                "spending_reservation_misconfigured": "Daily spending limit requires a valid per-request reservation",
+            }
+            raise BudgetExceeded(category or "budget_exhausted", messages.get(category, "AI budget unavailable"), 429)
+
+    def finish_budget(self, request_id: str, *, uncertain: bool = False) -> None:
+        self.store.finish_budget(request_id, uncertain=uncertain)
 
     def pricing_status(self) -> dict[str, Any]:
         return {"configured_models": sorted(self.pricing),

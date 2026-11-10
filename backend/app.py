@@ -1,11 +1,11 @@
 """Provider-independent, authenticated AI Gateway with legacy /v1/reply compatibility."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
-import time
-from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Any, Literal
 
@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse
 from ai_gateway.config import TASKS, env_credentials
 from ai_gateway.manager import GatewayManager, GatewayUnavailable
 from ai_gateway.security.access_control import AccessConfigurationError, UnauthorizedError, verify_bearer_token
+from ai_gateway.security.rate_limiter import RateLimiter, RateLimitUnavailable
 from ai_gateway.tasks.image_extraction import normalize_ocr_result
 from ai_gateway.types import ProviderConfig
 
@@ -25,11 +26,14 @@ app = FastAPI(title="WhatsApp Auto Responder AI Gateway", version="0.2.0",
               docs_url="/docs" if _expose_docs else None,
               redoc_url="/redoc" if _expose_docs else None,
               openapi_url="/openapi.json" if _expose_docs else None)
-_rate_lock = threading.Lock()
-_requests: dict[str, deque[float]] = defaultdict(deque)
-_WINDOW_SECONDS = 60
-MAX_IMAGE_BYTES = max(1024, min(int(os.getenv("AI_MAX_IMAGE_BYTES", str(8 * 1024 * 1024))), 20 * 1024 * 1024))
+rate_limiter = RateLimiter()
+MAX_IMAGE_BYTES = max(1, min(int(os.getenv("AI_MAX_IMAGE_BYTES", str(8 * 1024 * 1024))), 8 * 1024 * 1024))
 MAX_BODY_BYTES = MAX_IMAGE_BYTES + 512 * 1024
+MAX_CONCURRENT_UPLOADS = max(1, min(int(os.getenv("AI_MAX_CONCURRENT_UPLOADS", "2")), 2))
+UPLOAD_REQUEST_TIMEOUT_SECONDS = max(5, min(int(os.getenv("AI_UPLOAD_REQUEST_TIMEOUT_SECONDS", "120")), 300))
+_upload_slots = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
+_image_processing_slots = threading.BoundedSemaphore(MAX_CONCURRENT_UPLOADS)
+_image_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_UPLOADS, thread_name_prefix="image-provider")
 ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
 
 
@@ -154,6 +158,7 @@ class GatewaySettingsRequest(BaseModel):
     max_requests_per_day: int | None = Field(default=None, ge=1, le=1_000_000)
     max_requests_per_minute: int | None = Field(default=None, ge=1, le=100_000)
     max_daily_spend_usd: float | None = Field(default=None, ge=0, le=1_000_000)
+    max_request_spend_usd: float | None = Field(default=None, ge=0, le=1_000_000)
 
 
 def _authorize(authorization: str | None, env_name: str) -> None:
@@ -174,46 +179,44 @@ def _require_admin(authorization: str | None) -> None:
 
 
 def _rate_limit(client_ip: str) -> bool:
-    now = time.monotonic()
     try:
         limit = max(1, int(get_manager().store.get_settings().get(
             "max_requests_per_minute", os.getenv("REQUESTS_PER_MINUTE", "20"))))
-    except (ValueError, RuntimeError):
-        limit = 20
-    with _rate_lock:
-        if len(_requests) >= 4096 and client_ip not in _requests:
-            for address in list(_requests):
-                queue = _requests[address]
-                while queue and now - queue[0] >= _WINDOW_SECONDS:
-                    queue.popleft()
-                if not queue:
-                    _requests.pop(address, None)
-                if len(_requests) < 4096:
-                    break
-            if len(_requests) >= 4096:
-                _requests.pop(next(iter(_requests)), None)
-        recent = _requests[client_ip]
-        while recent and now - recent[0] >= _WINDOW_SECONDS:
-            recent.popleft()
-        if len(recent) >= limit:
-            return False
-        recent.append(now)
-        return True
+    except Exception:
+        limit = max(1, int(os.getenv("REQUESTS_PER_MINUTE", "20")))
+    return rate_limiter.allow(client_ip, limit)
 
 
 @app.middleware("http")
 async def enforce_body_limit(request: Request, call_next):
-    length = request.headers.get("content-length")
-    if length:
-        try:
-            if int(length) > MAX_BODY_BYTES:
-                return JSONResponse(status_code=413, content={"detail": "Request body exceeds the configured limit"})
-        except ValueError:
-            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
-    if (request.url.path.startswith("/api/") or request.url.path == "/v1/reply") and not _rate_limit(
-            request.client.host if request.client else "unknown"):
-        return JSONResponse(status_code=429, content={"detail": "Too many requests; try again later"})
-    return await call_next(request)
+    is_upload = request.method == "POST" and request.url.path in {
+        "/api/ai/extract-image", "/api/ai/understand-image"}
+    if is_upload:
+        await _upload_slots.acquire()
+    try:
+        length = request.headers.get("content-length")
+        if length:
+            try:
+                if int(length) > MAX_BODY_BYTES:
+                    return JSONResponse(status_code=413, content={"detail": "Request body exceeds the configured limit"})
+            except ValueError:
+                return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
+        if request.url.path.startswith("/api/") or request.url.path == "/v1/reply":
+            try:
+                allowed = await asyncio.to_thread(_rate_limit, request.client.host if request.client else "unknown")
+            except RateLimitUnavailable:
+                return JSONResponse(status_code=503, content={"detail": "Rate-limit protection is unavailable"})
+            if not allowed:
+                return JSONResponse(status_code=429, content={"detail": "Too many requests; try again later"})
+        if is_upload:
+            try:
+                return await asyncio.wait_for(call_next(request), timeout=UPLOAD_REQUEST_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                return JSONResponse(status_code=408, content={"detail": "Upload processing timed out"})
+        return await call_next(request)
+    finally:
+        if is_upload:
+            _upload_slots.release()
 
 
 @app.exception_handler(GatewayUnavailable)
@@ -230,9 +233,31 @@ async def validation_error_handler(_request: Request, exc: RequestValidationErro
     return JSONResponse(status_code=422, content={"detail": details})
 
 
+@app.get("/health/live")
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "service": "ai-gateway"}
+    """Liveness only; deliberately does not depend on SQLite or providers."""
+    return {"ok": True, "service": "ai-gateway", "status": "live"}
+
+
+@app.get("/health/ready")
+def readiness():
+    try:
+        manager = get_manager()
+        ready, reason = manager.store.readiness_check()
+        if ready:
+            with manager.store._db() as db:
+                rows = db.execute("SELECT encrypted_secret FROM api_keys").fetchall()
+            for row in rows:
+                manager.secrets.decrypt(row["encrypted_secret"])
+        if not ready:
+            return JSONResponse(status_code=503, content={"ok": False, "status": "not_ready", "reason": reason})
+        if not rate_limiter.ready():
+            return JSONResponse(status_code=503, content={"ok": False, "status": "not_ready", "reason": "rate_limit_unavailable"})
+        return {"ok": True, "status": "ready", "service": "ai-gateway"}
+    except Exception:
+        # Do not include SQLite paths, encryption configuration, or secret-related exception detail.
+        return JSONResponse(status_code=503, content={"ok": False, "status": "not_ready", "reason": "dependency_unavailable"})
 
 
 def _text_response(result) -> dict[str, Any]:
@@ -314,7 +339,20 @@ async def _image_request(task: Literal["image_extraction", "image_understanding"
     data, mime = await _read_upload(file)
     knowledge = _knowledge_from_form(knowledge_json) if task == "image_understanding" else []
     history = _history_from_form(history_json) if task == "image_understanding" else []
-    result = get_manager().process_image(task, data, mime, question, knowledge, history)
+    manager = get_manager()
+    if not _image_processing_slots.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="Image processing capacity is busy; retry later")
+    try:
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            _image_executor, manager.process_image, task, data, mime, question, knowledge, history)
+    except BaseException:
+        _image_processing_slots.release()
+        raise
+    # Keep the permit until the actual provider worker exits, even if the HTTP request times out
+    # or its client disconnects; cancellation cannot stop an already-running Python thread.
+    future.add_done_callback(lambda _completed: _image_processing_slots.release())
+    result = await asyncio.shield(future)
     common = {"provider_used": result.provider_id, "model_used": result.model,
               "request_id": result.request_id, "fallback_count": result.fallback_count}
     if task == "image_extraction":
@@ -479,7 +517,10 @@ def update_gateway_settings(payload: GatewaySettingsRequest, authorization: str 
     _require_admin(authorization)
     values = payload.model_dump(exclude_unset=True)
     manager = get_manager()
-    manager.store.update_settings(values)
+    try:
+        manager.store.update_settings(values)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     return {"settings": manager.store.get_settings()}
 
 

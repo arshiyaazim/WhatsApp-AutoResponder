@@ -6,9 +6,16 @@ local.properties
 .idea/
 .DS_Store
 
-# Python legacy / local artifacts
+# Python local artifacts
 *.pyc
 __pycache__/
 myvenv/
 .venv/
+
+# Local secrets, env files and database/backups
 backend/.env
+.env
+secrets/
+backups/
+*.sqlite3
+*.sqlite3-*

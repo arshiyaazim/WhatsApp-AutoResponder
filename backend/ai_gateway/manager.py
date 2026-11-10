@@ -45,9 +45,11 @@ class GatewayManager:
 
     def _budget_check(self, request_id: str) -> None:
         try:
-            self.usage.check_budget()
+            self.usage.check_budget(request_id)
         except BudgetExceeded as exc:
             raise GatewayUnavailable(exc.category, exc.message, request_id, exc.status_code) from None
+        except Exception:
+            raise GatewayUnavailable("budget_store_unavailable", "AI budget protection is unavailable", request_id, 503) from None
 
     def _record(self, *, request_id: str, task: Task, provider_id: str | None, model: str | None,
                 key: KeyCredential | None, outcome: str, started: float, result: ProviderResult | None,
@@ -59,7 +61,26 @@ class GatewayManager:
     def _attempt(self, task: Task, message: str, knowledge: list[dict[str, Any]], history: list[dict[str, str]],
                  mime_type: str | None, image: bytes | None, question: str) -> GatewayResult:
         request_id = uuid.uuid4().hex
-        self._budget_check(request_id)
+        try:
+            self.usage.check_budget(request_id)
+        except BudgetExceeded as exc:
+            raise GatewayUnavailable(exc.category, exc.message, request_id, exc.status_code) from None
+        except Exception:
+            # Database/reservation failures fail closed; never call a provider without a reservation.
+            raise GatewayUnavailable("budget_store_unavailable", "AI budget protection is unavailable", request_id, 503) from None
+        budget_state = {"uncertain": False}
+        try:
+            return self._run_attempt(request_id, task, message, knowledge, history, mime_type, image, question, budget_state)
+        finally:
+            try:
+                self.usage.finish_budget(request_id, uncertain=budget_state["uncertain"])
+            except Exception:
+                # Reservation lease expiry conservatively retains the full allowance.
+                pass
+
+    def _run_attempt(self, request_id: str, task: Task, message: str, knowledge: list[dict[str, Any]],
+                     history: list[dict[str, str]], mime_type: str | None, image: bytes | None,
+                     question: str, budget_state: dict[str, bool]) -> GatewayResult:
         automatic_failover = self.fallback.enabled()
         attempted = 0
         last_category = "no_provider_available"
@@ -112,9 +133,11 @@ class GatewayManager:
                 attempted += 1
                 provider_attempts += 1
                 started = time.perf_counter()
+                provider_returned = False
                 try:
                     result = self._invoke(adapter, task, config, credential, model, message, knowledge, history,
                                           mime_type, image, question)
+                    provider_returned = True
                     if not result.text.strip():
                         raise ProviderError("empty_response", "Provider returned an empty response", retryable=True)
                     self.health.record_success(provider_id, credential.key_id)
@@ -125,6 +148,14 @@ class GatewayManager:
                                          result.input_tokens, result.output_tokens, credential.key_id, credential.project_id)
                 except Exception as error:
                     normalized = error if isinstance(error, ProviderError) else adapter.normalize_error(error)
+                    if provider_returned or normalized.category not in {"authentication", "permission", "invalid_request"}:
+                        # Persist uncertainty before failure logging; if SQLite is transiently unavailable,
+                        # the request-local flag still makes finalization retain the reservation.
+                        budget_state["uncertain"] = True
+                        try:
+                            self.store.mark_budget_uncertain(request_id)
+                        except Exception:
+                            pass
                     last_category = normalized.category
                     action = self.quotas.record_failure(provider_id, credential, normalized)
                     if action == "skip_project" and credential.project_id:
@@ -228,14 +259,26 @@ class GatewayManager:
         return {"providers": self.providers_public(), "fallback_order": self.store.fallback_orders(),
                 "automatic_failover": settings.get("automatic_failover", True),
                 "daily_limits": {"max_requests": settings.get("max_requests_per_day"),
-                                 "max_estimated_spend_usd": settings.get("max_daily_spend_usd")},
+                                 "max_estimated_spend_usd": settings.get("max_daily_spend_usd"),
+                                 "max_request_spend_reservation_usd": settings.get("max_request_spend_usd")},
                 "requests_per_minute_limit": settings.get("max_requests_per_minute"),
                 "today": self.store.daily_usage()}
 
     def test_provider(self, provider_id: str) -> dict[str, Any]:
-        provider = self.store.get_provider(provider_id)
         request_id = uuid.uuid4().hex
         self._budget_check(request_id)
+        budget_state = {"uncertain": False}
+        try:
+            return self._test_provider_reserved(provider_id, request_id, budget_state)
+        finally:
+            try:
+                self.usage.finish_budget(request_id, uncertain=budget_state["uncertain"])
+            except Exception:
+                pass
+
+    def _test_provider_reserved(self, provider_id: str, request_id: str,
+                                budget_state: dict[str, bool]) -> dict[str, Any]:
+        provider = self.store.get_provider(provider_id)
         if not provider or not provider.enabled:
             raise GatewayUnavailable("provider_disabled", "Provider is missing or disabled", request_id, 404)
         adapter = create_adapter(provider.provider_type)
@@ -256,8 +299,10 @@ class GatewayManager:
             if credential.project_id and credential.project_id in skipped_projects:
                 continue
             started = time.perf_counter()
+            provider_returned = False
             try:
                 adapter.health_check(api_key=credential.secret, model=model, base_url=provider.base_url)
+                provider_returned = True
                 self.health.record_success(provider_id, credential.key_id)
                 self._record(request_id=request_id, task="text_generation", provider_id=provider_id, model=model,
                              key=credential, outcome="success", started=started, result=None,
@@ -266,6 +311,12 @@ class GatewayManager:
                         "key_id": credential.key_id, "latency_ms": int((time.perf_counter() - started) * 1000), "healthy": True}
             except Exception as exc:
                 normalized = exc if isinstance(exc, ProviderError) else adapter.normalize_error(exc)
+                if provider_returned or normalized.category not in {"authentication", "permission", "invalid_request"}:
+                    budget_state["uncertain"] = True
+                    try:
+                        self.store.mark_budget_uncertain(request_id)
+                    except Exception:
+                        pass
                 errors.append(normalized.category)
                 action = self.quotas.record_failure(provider_id, credential, normalized)
                 self._record(request_id=request_id, task="text_generation", provider_id=provider_id, model=model,

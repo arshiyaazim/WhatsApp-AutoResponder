@@ -6,3 +6,4 @@ anthropic>=0.40,<1
 cryptography>=43,<47
 python-multipart>=0.0.20,<1
 httpx>=0.28,<1  # TestClient for backend tests
+redis>=5,<7  # Shared multi-worker rate limiting
