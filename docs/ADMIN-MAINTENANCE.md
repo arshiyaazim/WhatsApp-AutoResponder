@@ -1,5 +1,7 @@
 # Admin and Maintenance Guide
 
+All Compose commands below explicitly use project `whatsapp_autoresponder`; if the preflight required a different unique value in `.env`, substitute that exact value consistently. Do not operate on an existing project name.
+
 Use a private terminal and HTTPS to the dedicated backend subdomain. The `ADMIN_ACCESS_TOKEN` is only for admin endpoints; the Android app must use the separate `APP_ACCESS_TOKEN`. Provider keys stay on the server. Never paste any secret into tickets, logs, chat, screenshots or Git.
 
 ```bash
@@ -25,8 +27,8 @@ curl -fsS "$BASE/health/ready"
 curl_app -fsS "$BASE/api/ai/status"
 curl_admin -fsS "$BASE/api/admin/providers"
 curl_admin -fsS "$BASE/api/ai/usage"
-docker compose ps
-docker compose logs --tail=100 ai-gateway rate-limit
+docker compose --project-name whatsapp_autoresponder ps
+docker compose --project-name whatsapp_autoresponder logs --tail=100 ai-gateway rate-limit
 ```
 
 `/health/live` checks only that the web process responds. `/health/ready` also checks SQLite schema/integrity, encrypted-key decryptability and Redis. Do not share full admin/usage responses publicly; provider names, usage and error metadata can be sensitive. Errors deliberately omit credentials and request contents.
@@ -40,7 +42,7 @@ sudoedit secrets/gemini_api_keys.json
 # Example structure: [{"key":"<KEY>","project_id":"<GCP_PROJECT>"}]
 sudo find secrets -maxdepth 1 -type f -exec chown root:10001 {} +
 sudo find secrets -maxdepth 1 -type f -exec chmod 0440 {} +
-docker compose up -d --no-build --force-recreate ai-gateway
+docker compose --project-name whatsapp_autoresponder up -d --no-build --force-recreate ai-gateway
 curl -fsS "$BASE/health/ready"
 ```
 
@@ -106,12 +108,12 @@ set -eu
 umask 077
 mkdir -p backups && chmod 700 backups
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-CONTAINER="$(docker compose ps -q ai-gateway)"
-docker compose exec -T ai-gateway python db_admin.py backup \
+CONTAINER="$(docker compose --project-name whatsapp_autoresponder ps -q ai-gateway)"
+docker compose --project-name whatsapp_autoresponder exec -T ai-gateway python db_admin.py backup \
   /data/ai_gateway.sqlite3 "/data/ai-gateway-backup-${STAMP}.sqlite3"
 docker cp "${CONTAINER}:/data/ai-gateway-backup-${STAMP}.sqlite3" \
   "backups/ai-gateway-${STAMP}.sqlite3"
-docker compose exec -T ai-gateway rm -f "/data/ai-gateway-backup-${STAMP}.sqlite3"
+docker compose --project-name whatsapp_autoresponder exec -T ai-gateway rm -f "/data/ai-gateway-backup-${STAMP}.sqlite3"
 python3 backend/db_admin.py verify "backups/ai-gateway-${STAMP}.sqlite3"
 chmod 600 "backups/ai-gateway-${STAMP}.sqlite3"
 ```
@@ -134,7 +136,7 @@ Do not replace the primary key without a matching backup and re-encryption. The 
 2. Back up and integrity-verify SQLite; securely retain the old key separately.
 3. Generate a new Fernet key using the root-owned secret-generation process or a trusted Fernet tool. Do not print it.
 4. Put the new key in `secrets/provider_encryption_key`; put the old key in `secrets/provider_encryption_previous_keys.json` as a JSON array. Keep the primary explicit.
-5. With the gateway stopped, run `docker compose run --rm --no-deps ai-gateway python rotate_encryption_key.py /data/ai_gateway.sqlite3`.
+5. With the gateway stopped, run `docker compose --project-name whatsapp_autoresponder run --rm --no-deps ai-gateway python rotate_encryption_key.py /data/ai_gateway.sqlite3`.
 6. Start/recreate the gateway with both keys mounted; verify readiness and encrypted-key access before removing the old key from the previous-key file.
 7. Retain the pre-rotation DB/key backups until the staging restore drill succeeds.
 
@@ -148,9 +150,9 @@ Use a new reviewed Git commit and unique image tag for every release; never reus
 2. Back up SQLite, matching encryption material, `.env`, and any changed secret files.
 3. Record the current image tag and confirm the old image still exists locally.
 4. Fetch and check out the approved full commit; set `AI_GATEWAY_IMAGE_TAG=release-<short-commit>` in `.env`.
-5. Run `docker compose config`, then `docker compose build --pull ai-gateway` and `docker compose up -d --no-deps ai-gateway`.
+5. Run `docker compose --project-name whatsapp_autoresponder config`, then `docker compose --project-name whatsapp_autoresponder build --pull ai-gateway` and `docker compose --project-name whatsapp_autoresponder up -d --no-deps ai-gateway`.
 6. Verify container health, `/health/ready`, HTTPS, staging-appropriate provider check, text and OCR; keep the previous image until accepted.
 
-For an image/config rollback, restore the saved `.env` (for example, `cp -p backups/env-<UTC_TIMESTAMP>.txt .env`) and secret files from their protected backup, then run `docker compose up -d --no-deps --no-build ai-gateway`. This reuses the retained previous image. Restore SQLite only if the new version made an incompatible DB change and after the staging recovery procedure is proven. Do not use `docker compose down -v`, do not prune the prior image, and do not restart or edit unrelated Compose projects.
+For an image/config rollback, restore the saved `.env` (for example, `cp -p backups/env-<UTC_TIMESTAMP>.txt .env`) and secret files from their protected backup, then run `docker compose --project-name whatsapp_autoresponder up -d --no-deps --no-build ai-gateway`. This reuses the retained previous image. Restore SQLite only if the new version made an incompatible DB change and after the staging recovery procedure is proven. Do not use `docker compose --project-name whatsapp_autoresponder down -v`, do not prune the prior image, and do not restart or edit unrelated Compose projects.
 
-`docker compose logs --tail=100 ai-gateway rate-limit` and `/api/ai/usage` help diagnose operations, but never enable shell tracing or publish secrets, prompts, message contents, uploaded images, raw Nginx configuration, or unredacted logs.
+`docker compose --project-name whatsapp_autoresponder logs --tail=100 ai-gateway rate-limit` and `/api/ai/usage` help diagnose operations, but never enable shell tracing or publish secrets, prompts, message contents, uploaded images, raw Nginx configuration, or unredacted logs.

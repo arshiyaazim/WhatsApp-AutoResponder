@@ -1,13 +1,15 @@
+name: ${COMPOSE_PROJECT_NAME:-whatsapp_autoresponder}
+
 services:
   ai-gateway:
-    image: whatsapp-ai-gateway:${AI_GATEWAY_IMAGE_TAG:?Set an immutable release tag in the root .env}
+    image: ${COMPOSE_PROJECT_NAME:-whatsapp_autoresponder}-ai-gateway:${AI_GATEWAY_IMAGE_TAG:?Set an immutable release tag in the root .env}
     build:
       context: ./backend
     environment:
       DATABASE_PATH: /data/ai_gateway.sqlite3
       RATE_LIMIT_BACKEND: redis
       RATE_LIMIT_REDIS_URL: redis://rate-limit:6379/0
-      RATE_LIMIT_KEY_PREFIX: ${RATE_LIMIT_KEY_PREFIX:-ai-gateway}
+      RATE_LIMIT_KEY_PREFIX: ${RATE_LIMIT_KEY_PREFIX:-whatsapp_autoresponder}
       APP_ACCESS_TOKEN_FILE: /run/secrets/app_access_token
       ADMIN_ACCESS_TOKEN_FILE: /run/secrets/admin_access_token
       PROVIDER_ENCRYPTION_KEY_FILE: /run/secrets/provider_encryption_key

@@ -224,12 +224,14 @@ class ReleaseControlTests(unittest.TestCase):
         redis_client = Mock()
         redis_client.eval.return_value = 1
         fake_redis = SimpleNamespace(Redis=SimpleNamespace(from_url=Mock(return_value=redis_client)))
-        with patch.dict(os.environ, {"RATE_LIMIT_BACKEND": "redis", "RATE_LIMIT_REDIS_URL": "redis://rate-limit:6379/0"}), \
+        with patch.dict(os.environ, {"RATE_LIMIT_BACKEND": "redis", "RATE_LIMIT_REDIS_URL": "redis://rate-limit:6379/0",
+                                    "RATE_LIMIT_KEY_PREFIX": "whatsapp_autoresponder:"}), \
                 patch.dict(sys.modules, {"redis": fake_redis}):
             limiter = RateLimiter()
             self.assertTrue(limiter.ready())
             self.assertTrue(limiter.allow("192.0.2.10", 5))
             redis_client.eval.assert_called_once()
+            self.assertTrue(redis_client.eval.call_args.args[2].startswith("whatsapp_autoresponder:rate:"))
             redis_client.eval.side_effect = OSError("backend down")
             redis_client.ping.side_effect = OSError("backend down")
             self.assertFalse(limiter.ready())
