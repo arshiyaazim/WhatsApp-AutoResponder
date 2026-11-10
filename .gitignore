@@ -1,2 +1,12 @@
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+
+# Python legacy / local artifacts
 *.pyc
-myvenv
+__pycache__/
+myvenv/
