@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import email.utils
+import math
 from abc import ABC, abstractmethod
 from typing import Any
 
 from ..types import ProviderError, ProviderResult, Task
 
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
+MAX_RETRY_AFTER_SECONDS = 3600
 
 
 class ProviderAdapter(ABC):
@@ -58,6 +60,11 @@ class ProviderAdapter(ABC):
                 retry_after = max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
             except Exception:
                 retry_after = None
+        if retry_after is not None:
+            if math.isnan(retry_after):
+                retry_after = None
+            else:
+                retry_after = min(MAX_RETRY_AFTER_SECONDS, max(0.0, retry_after))
         if status == 401:
             return ProviderError("authentication", "Provider rejected the API key", status, retry_after, False)
         if status == 403:

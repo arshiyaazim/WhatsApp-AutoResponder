@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .security.secret_manager import SecretManager
-from .types import KeyCredential, ProviderConfig, Task
+from .types import KeyCredential, ProviderConfig
 
 
 class GatewayStore:
@@ -132,8 +132,15 @@ class GatewayStore:
     def add_key(self, provider_id: str, secret: str, project_id: str | None, label: str) -> str:
         if not self.secret_manager.available:
             raise RuntimeError("PROVIDER_ENCRYPTION_KEY must be configured before adding database-managed keys")
-        if self.get_provider(provider_id) is None:
+        provider = self.get_provider(provider_id)
+        if provider is None:
             raise KeyError("provider not found")
+        project_id = (project_id or "").strip() or None
+        if provider.provider_type == "gemini" and project_id is None:
+            raise ValueError("Gemini keys require a project ID")
+        secret = secret.strip()
+        if not secret:
+            raise ValueError("API key must not be empty")
         key_id = uuid.uuid4().hex
         encrypted = self.secret_manager.encrypt(secret)
         with self._db() as db:

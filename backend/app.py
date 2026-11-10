@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.responses import JSONResponse
 
-from ai_gateway.config import PROVIDER_TYPES, TASKS, custom_provider_defaults, default_provider_configs, env_credentials
+from ai_gateway.config import TASKS, env_credentials
 from ai_gateway.manager import GatewayManager, GatewayUnavailable
 from ai_gateway.security.access_control import AccessConfigurationError, UnauthorizedError, verify_bearer_token
 from ai_gateway.tasks.image_extraction import normalize_ocr_result
@@ -31,6 +31,71 @@ _WINDOW_SECONDS = 60
 MAX_IMAGE_BYTES = max(1024, min(int(os.getenv("AI_MAX_IMAGE_BYTES", str(8 * 1024 * 1024))), 20 * 1024 * 1024))
 MAX_BODY_BYTES = MAX_IMAGE_BYTES + 512 * 1024
 ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+
+
+class RequestBodyLimitMiddleware:
+    """Bound streamed/chunked API bodies as well as requests with Content-Length."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        method = scope.get("method", "")
+        if scope.get("type") != "http" or method not in {"POST", "PUT", "PATCH"} or not (
+                path.startswith("/api/") or path == "/v1/reply"):
+            await self.app(scope, receive, send)
+            return
+
+        # Reject unauthenticated image bodies before multipart parsing creates temporary upload files.
+        if path in {"/api/ai/extract-image", "/api/ai/understand-image"}:
+            headers = dict(scope.get("headers", []))
+            authorization = headers.get(b"authorization", b"").decode("latin-1") or None
+            try:
+                verify_bearer_token(authorization, "APP_ACCESS_TOKEN")
+            except AccessConfigurationError as exc:
+                response = JSONResponse(status_code=503, content={"detail": str(exc)})
+                await response(scope, receive, send)
+                return
+            except UnauthorizedError:
+                response = JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+                await response(scope, receive, send)
+                return
+
+        total = 0
+        too_large = False
+        response_messages = []
+
+        async def bounded_receive():
+            nonlocal total, too_large
+            message = await receive()
+            if message.get("type") == "http.request":
+                total += len(message.get("body", b""))
+                if total > self.max_bytes:
+                    too_large = True
+                    # Let framework parsers terminate and close any temporary upload handles.
+                    return {"type": "http.request", "body": b"", "more_body": False}
+            return message
+
+        async def buffered_send(message):
+            response_messages.append(message)
+
+        try:
+            await self.app(scope, bounded_receive, buffered_send)
+        except BaseException:
+            if not too_large:
+                raise
+        if too_large:
+            response = JSONResponse(status_code=413, content={"detail": "Request body exceeds the configured limit"})
+            await response(scope, receive, send)
+            return
+        for message in response_messages:
+            await send(message)
+
+
+# Add before the HTTP middleware below so its per-IP rate check runs before body consumption.
+app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 
 
 @lru_cache(maxsize=1)
@@ -171,7 +236,10 @@ def health() -> dict[str, Any]:
 
 
 def _text_response(result) -> dict[str, Any]:
-    return {"reply": result.text, "text": result.text, "provider_used": result.provider_id,
+    text = result.text.strip()
+    # Preserve the legacy contract: the sentinel means silence, never a literal WhatsApp reply.
+    reply = "" if text == "[NO_REPLY]" else text[:2000]
+    return {"reply": reply, "text": reply, "provider_used": result.provider_id,
             "model_used": result.model, "request_id": result.request_id,
             "fallback_count": result.fallback_count}
 
@@ -347,13 +415,17 @@ def add_provider_key(provider_id: str, payload: ProviderKeyRequest, authorizatio
     provider = manager.store.get_provider(provider_id)
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
-    if provider.provider_type == "gemini" and not (payload.project_id or "").strip():
+    project_id = (payload.project_id or "").strip() or None
+    api_key = payload.api_key.get_secret_value().strip()
+    if provider.provider_type == "gemini" and not project_id:
         raise HTTPException(status_code=422, detail="Gemini keys require project_id so shared project quota is respected")
     try:
-        key_id = manager.store.add_key(provider_id, payload.api_key.get_secret_value(), payload.project_id, payload.label)
+        key_id = manager.store.add_key(provider_id, api_key, project_id, payload.label)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
-    return {"key_id": key_id, "provider_id": provider_id, "project_id": payload.project_id,
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {"key_id": key_id, "provider_id": provider_id, "project_id": project_id,
             "source": "encrypted_database", "secret_returned": False}
 
 

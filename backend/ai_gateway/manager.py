@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import time
 import uuid
 from typing import Any
@@ -26,6 +25,10 @@ class GatewayUnavailable(Exception):
 
 
 class GatewayManager:
+    # Bound one logical request even if an administrator configures many duplicate keys/providers.
+    MAX_KEY_ATTEMPTS_PER_PROVIDER = 3
+    MAX_PROVIDER_KEY_ATTEMPTS_PER_REQUEST = 24
+
     def __init__(self, database_path: str | None = None) -> None:
         self.secrets = SecretManager()
         self.store = GatewayStore(self.secrets, database_path)
@@ -98,10 +101,16 @@ class GatewayManager:
 
             skipped_projects: set[str] = set()
             skip_provider = False
+            provider_attempts = 0
             for credential in credentials:
+                if attempted >= self.MAX_PROVIDER_KEY_ATTEMPTS_PER_REQUEST:
+                    break
+                if provider_attempts >= self.MAX_KEY_ATTEMPTS_PER_PROVIDER:
+                    break
                 if credential.project_id and credential.project_id in skipped_projects:
                     continue
                 attempted += 1
+                provider_attempts += 1
                 started = time.perf_counter()
                 try:
                     result = self._invoke(adapter, task, config, credential, model, message, knowledge, history,
@@ -125,6 +134,8 @@ class GatewayManager:
                     self._record(request_id=request_id, task=task, provider_id=provider_id, model=model,
                                  key=credential, outcome="error", started=started, result=None,
                                  category=normalized.category, fallback_count=attempted - 1)
+                    if not automatic_failover:
+                        raise GatewayUnavailable(last_category, "Selected AI provider request failed", request_id, 502)
                     if skip_provider:
                         break
             if not automatic_failover:
@@ -240,6 +251,8 @@ class GatewayManager:
         errors = []
         skipped_projects: set[str] = set()
         for credential in credentials:
+            if len(errors) >= self.MAX_KEY_ATTEMPTS_PER_PROVIDER:
+                break
             if credential.project_id and credential.project_id in skipped_projects:
                 continue
             started = time.perf_counter()
@@ -258,6 +271,8 @@ class GatewayManager:
                 self._record(request_id=request_id, task="text_generation", provider_id=provider_id, model=model,
                              key=credential, outcome="error", started=started, result=None,
                              category=normalized.category, fallback_count=len(errors) - 1)
+                if action == "skip_project" and credential.project_id:
+                    skipped_projects.add(credential.project_id)
                 if action == "skip_provider":
                     break
         raise GatewayUnavailable(errors[-1] if errors else "provider_error", "Provider connectivity test failed", request_id, 502)

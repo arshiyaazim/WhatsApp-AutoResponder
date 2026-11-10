@@ -12,6 +12,7 @@ sys.path.insert(0, str(sys_path))
 
 from ai_gateway.manager import GatewayManager, GatewayUnavailable
 from ai_gateway.providers.base import ProviderAdapter
+from ai_gateway.security.secret_manager import SecretManager
 from ai_gateway.types import ProviderError, ProviderResult
 
 
@@ -96,6 +97,16 @@ class GatewayTests(unittest.TestCase):
             "image_understanding": image or ["gemini-primary", "openai-secondary", "anthropic-third"],
         })
 
+    def test_provider_encryption_key_must_not_equal_access_token(self):
+        encryption_key = Fernet.generate_key().decode()
+        with patch.dict(os.environ, {
+            "PROVIDER_ENCRYPTION_KEY": encryption_key,
+            "APP_ACCESS_TOKEN": encryption_key,
+            "ADMIN_ACCESS_TOKEN": "distinct-admin-token",
+        }):
+            with self.assertRaisesRegex(RuntimeError, "must be distinct"):
+                SecretManager()
+
     def test_gemini_primary_handles_text_before_secondary(self):
         self.order()
         self.add_key("gemini-primary", "gem-key", "project-a")
@@ -124,6 +135,19 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual([call[2] for call in self.calls], ["rate-key", "healthy-key"])
         self.assertEqual(self.manager.store.key_state(key1)["status"], "cooldown")
 
+    def test_rate_limit_key_attempts_are_bounded_before_provider_fallback(self):
+        self.order()
+        for index in range(5):
+            key = f"rate-key-{index}"
+            self.add_key("gemini-primary", key, f"project-{index}", index)
+            self.behavior[key] = ProviderError("rate_limited", "try later", 429, 30, True)
+        self.add_key("openai-secondary", "openai-healthy", index=10)
+        result = self.manager.generate_text("hello", [{"question": "hello", "answer": "Hi!"}], [])
+        self.assertEqual(result.provider_id, "openai-secondary")
+        gemini_calls = [call for call in self.calls if call[0] == "gemini"]
+        self.assertEqual(len(gemini_calls), self.manager.MAX_KEY_ATTEMPTS_PER_PROVIDER)
+        self.assertEqual(self.calls[-1][0], "openai")
+
     def test_gemini_quota_exhaustion_skips_same_project_keys(self):
         self.order()
         self.add_key("gemini-primary", "project-a-key-one", "project-a", 0)
@@ -136,6 +160,14 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(attempted, ["project-a-key-one", "project-b-key"])
         self.assertNotIn("project-a-key-two", attempted)
         self.assertEqual(self.manager.store.project_state("gemini-primary", "project-a")["status"], "quota_exhausted")
+
+    def test_provider_health_check_skips_all_keys_after_project_quota_exhaustion(self):
+        self.add_key("gemini-primary", "project-exhausted-first", "shared-project", 0)
+        self.add_key("gemini-primary", "project-exhausted-second", "shared-project", 1)
+        self.behavior["project-exhausted-first"] = ProviderError("quota_exhausted", "RESOURCE_EXHAUSTED", 429)
+        with self.assertRaises(GatewayUnavailable):
+            self.manager.test_provider("gemini-primary")
+        self.assertEqual(self.calls, [("gemini", "health_check", "project-exhausted-first")])
 
     def test_unauthenticated_key_is_disabled_and_fallback_continues(self):
         self.order()
@@ -172,6 +204,17 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(GatewayUnavailable):
             self.manager.generate_text("hello", [], [])
         self.assertEqual([call[0] for call in self.calls], ["gemini"])
+
+    def test_disabling_failover_stops_after_first_key_failure(self):
+        self.manager.store.update_settings({"automatic_failover": False})
+        self.order()
+        self.add_key("gemini-primary", "first-failing-key", "project-a", 0)
+        self.add_key("gemini-primary", "second-key", "project-b", 1)
+        self.add_key("openai-secondary", "openai-key", index=2)
+        self.behavior["first-failing-key"] = ProviderError("temporary_service", "down", 503, retryable=True)
+        with self.assertRaises(GatewayUnavailable):
+            self.manager.generate_text("hello", [{"question": "hello", "answer": "Hi!"}], [])
+        self.assertEqual(self.calls, [("gemini", "text_generation", "first-failing-key")])
 
     def test_request_usage_does_not_store_prompt_text(self):
         self.order()
